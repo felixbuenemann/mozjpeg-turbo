@@ -946,6 +946,8 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
   int num_nz, jj;
   unsigned long long qval_recip[DCTSIZE2];  /* reciprocals for qval division */
   int half_q[DCTSIZE2];
+  int ac_zero_thresh[DCTSIZE2];
+  int zero_block_check;
   int bi;
   float best_cost;
   int last_coeff_idx; /* position of last nonzero coefficient */
@@ -1024,7 +1026,19 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
     unsigned int q = 8 * qtbl->quantval[i];
     qval_recip[i] = ((1ULL << 39) + q - 1) / q;
     half_q[i] = q >> 1;
+    /* An AC coefficient quantizes to zero iff abs(x) + q/2 < q, i.e.
+     * abs(x) < 4 * quantval. */
+    ac_zero_thresh[i] = 4 * qtbl->quantval[i];
   }
+
+  /* If the scan covers the complete AC band and no inter-block state is
+   * accumulated, then a block in which every AC coefficient quantizes to
+   * zero can skip the AC optimization entirely; its net effect is to zero
+   * the band.
+   */
+  zero_block_check = (Ss == 1 && Se == DCTSIZE2 - 1 &&
+                      !cinfo->master->trellis_eob_opt &&
+                      !cinfo->master->trellis_q_opt);
 
   norm = 0.0;
   for (i = 1; i < DCTSIZE2; i++) {
@@ -1138,6 +1152,24 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
           accumulated_dc_cost[k][bi] = best_cost_k;
           dc_cost_backtrack[k][bi] = best_l;
         }
+      }
+    }
+
+    /* If every AC coefficient in the block quantizes to zero, then the AC
+     * optimization below reduces to zeroing the band: every candidate list
+     * is empty, so no symbols can be coded.  (The check is written without
+     * an early exit so that the compiler can vectorize it.)
+     */
+    if (zero_block_check) {
+      int any_nonzero = 0;
+
+      for (i = 1; i < DCTSIZE2; i++)
+        any_nonzero |= (abs(src[bi][i]) >= ac_zero_thresh[i]);
+
+      if (!any_nonzero) {
+        for (i = 1; i < DCTSIZE2; i++)
+          coef_blocks[bi][i] = 0;
+        continue;
       }
     }
 

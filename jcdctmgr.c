@@ -960,6 +960,7 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
   unsigned long long qval_recip[DCTSIZE2];  /* reciprocals for qval division */
   int half_q[DCTSIZE2];
   int ac_zero_thresh[DCTSIZE2];
+  double pow2_scale1, pow2_scale2, pow2_scale1_m12;
   int zero_block_check;
 #ifdef TRELLIS_NEON
   int16_t nz_pos16[DCTSIZE2];   /* nz_idx, as int16 */
@@ -1051,6 +1052,11 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
     ac_zero_thresh[i] = 4 * qtbl->quantval[i];
   }
 
+  /* The lambda scale factors are loop invariants. */
+  pow2_scale1 = pow(2.0, cinfo->master->lambda_log_scale1);
+  pow2_scale2 = pow(2.0, cinfo->master->lambda_log_scale2);
+  pow2_scale1_m12 = pow(2.0, cinfo->master->lambda_log_scale1 - 12.0);
+
   /* If the scan covers the complete AC band and no inter-block state is
    * accumulated, then a block in which every AC coefficient quantizes to
    * zero can skip the AC optimization entirely; its net effect is to zero
@@ -1099,10 +1105,9 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
     norm /= 63.0;
     
     if (cinfo->master->lambda_log_scale2 > 0.0)
-      lambda = pow(2.0, cinfo->master->lambda_log_scale1) * lambda_base /
-                   (pow(2.0, cinfo->master->lambda_log_scale2) + norm);
+      lambda = pow2_scale1 * lambda_base / (pow2_scale2 + norm);
     else
-      lambda = pow(2.0, cinfo->master->lambda_log_scale1 - 12.0) * lambda_base;
+      lambda = pow2_scale1_m12 * lambda_base;
     
     lambda_dc = lambda * lambda_tbl[0];
     

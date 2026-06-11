@@ -73,4 +73,8 @@
 /* Use accelerated SIMD routines. */
 #cmakedefine WITH_SIMD 1
 
+/* Use multiple threads to evaluate the candidate scans of progressive scan
+   optimization */
+#cmakedefine WITH_SCAN_OPT_THREADS 1
+
 #endif

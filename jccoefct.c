@@ -499,6 +499,14 @@ METHODDEF(boolean)
 compress_output(j_compress_ptr cinfo, _JSAMPIMAGE input_buf)
 {
   my_coef_ptr coef = (my_coef_ptr)cinfo->coef;
+
+#ifdef WITH_SCAN_OPT_THREADS
+  /* When replaying a scan that was encoded ahead of time (jcparopt.c),
+   * there is nothing to do.
+   */
+  if (cinfo->master->par_scan_replay)
+    return TRUE;
+#endif
   JDIMENSION MCU_col_num;       /* index of current MCU within row */
   int blkn, ci, xindex, yindex, yoffset;
   JDIMENSION start_col;
@@ -573,6 +581,9 @@ _jinit_c_coef_controller(j_compress_ptr cinfo, boolean need_full_buffer)
   memset(coef, 0, sizeof(my_coef_controller));
   cinfo->coef = (struct jpeg_c_coef_controller *)coef;
   coef->pub.start_pass = start_pass_coef;
+#ifdef WITH_SCAN_OPT_THREADS
+  cinfo->master->par_coef_ctl = (void *)coef;
+#endif
 
   /* Create the coefficient buffer. */
   if (need_full_buffer) {
@@ -617,3 +628,28 @@ _jinit_c_coef_controller(j_compress_ptr cinfo, boolean need_full_buffer)
     coef->whole_image[0] = NULL; /* flag for no virtual arrays */
   }
 }
+
+
+#if defined(WITH_SCAN_OPT_THREADS) && BITS_IN_JSAMPLE == 8
+
+/*
+ * Expose the full-image coefficient arrays to the multithreaded
+ * candidate-scan evaluation (jcparopt.c.)
+ */
+
+GLOBAL(jvirt_barray_ptr *)
+jpeg_par_coef_arrays(j_compress_ptr cinfo)
+{
+  my_coef_ptr coef = (my_coef_ptr)cinfo->coef;
+
+  /* The coefficient controller must be the one defined in this file:
+   * during transcoding (jpegtran), cinfo->coef points to jctrans.c's
+   * controller, which has a different layout.
+   */
+  if (coef == NULL || (void *)coef != cinfo->master->par_coef_ctl ||
+      coef->whole_image[0] == NULL)
+    return NULL;
+  return coef->whole_image;
+}
+
+#endif

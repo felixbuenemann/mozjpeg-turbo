@@ -132,6 +132,17 @@ struct jpeg_comp_master {
                                           from the statistics-gathering pass
                                           [not exposed] */
 
+  void *par_scan_opt;      /* opaque state for the multithreaded evaluation of
+                              candidate scans (only used when the library is
+                              built with WITH_SCAN_OPT_THREADS) [not exposed] */
+  boolean par_scan_replay; /* TRUE while replaying a precomputed candidate
+                              scan, which makes the coefficient controller's
+                              passes no-ops [not exposed] */
+  void *par_coef_ctl;      /* identity of the coefficient controller, set by
+                              jccoefct.c so that the multithreaded scan
+                              evaluation can verify that the controller is
+                              not jctrans.c's (transcoding) [not exposed] */
+
   float lambda_log_scale1;
   float lambda_log_scale2;
   
@@ -640,6 +651,19 @@ EXTERN(void) j16init_lossless_decompressor(j_decompress_ptr cinfo);
 EXTERN(void) jinit_memory_mgr(j_common_ptr cinfo);
 
 #if JPEG_LIB_VERSION >= 80 || defined(MEM_SRCDST_SUPPORTED)
+#ifdef WITH_SCAN_OPT_THREADS
+/* Multithreaded evaluation of candidate scans for progressive scan
+ * optimization (jcparopt.c, jcmaster.c, jccoefct.c)
+ */
+EXTERN(void) jpeg_par_scan_opt_run(j_compress_ptr cinfo);
+EXTERN(boolean) jpeg_par_scan_replay_active(j_compress_ptr cinfo,
+                                            int scan_number);
+EXTERN(void) jpeg_par_scan_install(j_compress_ptr cinfo, int scan_number);
+EXTERN(void) jpeg_par_scan_opt_cleanup(j_compress_ptr cinfo);
+EXTERN(void) jpeg_par_per_scan_setup(j_compress_ptr cinfo);
+EXTERN(jvirt_barray_ptr *) jpeg_par_coef_arrays(j_compress_ptr cinfo);
+#endif
+
 EXTERN(void)
 jpeg_mem_dest_internal (j_compress_ptr cinfo,
                unsigned char **outbuffer, unsigned long *outsize, int pool_id);

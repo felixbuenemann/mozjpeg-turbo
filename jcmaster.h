@@ -33,6 +33,8 @@ typedef struct {
 
   /* fields for scan optimisation */
   int pass_number_scan_opt_base; /* pass number where scan optimization begins */
+  boolean par_attempted; /* TRUE once multithreaded scan evaluation has been
+                            attempted (WITH_SCAN_OPT_THREADS) */
   unsigned char * scan_buffer[64]; /* buffer for a given scan */
   unsigned long scan_size[64]; /* size for a given scan */
   int actual_Al[64]; /* actual value of Al used for a scan */

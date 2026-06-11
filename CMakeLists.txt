@@ -254,6 +254,23 @@ option(WITH_JPEG8
 boolean_number(WITH_JPEG8)
 option(WITH_SIMD "Include SIMD extensions, if available for this platform" TRUE)
 boolean_number(WITH_SIMD)
+option(WITH_SCAN_OPT_THREADS
+  "Use multiple threads to evaluate the candidate scans of progressive scan optimization (requires POSIX threads)"
+  FALSE)
+boolean_number(WITH_SCAN_OPT_THREADS)
+if(WITH_SCAN_OPT_THREADS)
+  set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+  find_package(Threads REQUIRED)
+  if(NOT CMAKE_USE_PTHREADS_INIT)
+    message(FATAL_ERROR "WITH_SCAN_OPT_THREADS requires POSIX threads")
+  endif()
+  if(CMAKE_THREAD_LIBS_INIT)
+    set(CMAKE_EXE_LINKER_FLAGS
+      "${CMAKE_EXE_LINKER_FLAGS} ${CMAKE_THREAD_LIBS_INIT}")
+    set(CMAKE_SHARED_LINKER_FLAGS
+      "${CMAKE_SHARED_LINKER_FLAGS} ${CMAKE_THREAD_LIBS_INIT}")
+  endif()
+endif()
 option(WITH_TURBOJPEG
   "Include the TurboJPEG API library and associated test programs" TRUE)
 boolean_number(WITH_TURBOJPEG)
@@ -304,6 +321,7 @@ report_option(WITH_ARITH_ENC "Arithmetic encoding support")
 
 report_option(WITH_TURBOJPEG "TurboJPEG API library")
 report_option(WITH_JAVA "TurboJPEG Java wrapper")
+report_option(WITH_SCAN_OPT_THREADS "Multithreaded scan optimization")
 
 if(NOT WITH_JPEG8)
   set(MEM_SRCDST_FUNCTIONS "global:  jpeg_mem_dest;  jpeg_mem_src;")
@@ -606,6 +624,7 @@ set(JPEG12_SOURCES ${JPEG16_SOURCES} jccoefct.c jcdctmgr.c jdcoefct.c
   jddctmgr.c jdmerge.c jfdctfst.c jfdctint.c jidctflt.c jidctfst.c jidctint.c
   jidctred.c jquant1.c jquant2.c)
 set(JPEG_SOURCES ${JPEG12_SOURCES} jcapimin.c jchuff.c jcicc.c jcinit.c
+  jcparopt.c
   jcext.c
   jclhuff.c jcmarker.c jcmaster.c jcomapi.c jcparam.c jcphuff.c jctrans.c
   jdapimin.c jdatadst.c jdatasrc.c jdhuff.c jdicc.c jdinput.c jdlhuff.c

@@ -613,6 +613,10 @@ METHODDEF(void)
 prepare_for_pass(j_compress_ptr cinfo)
 {
   my_master_ptr master = (my_master_ptr)cinfo->master;
+
+#ifdef WITH_SCAN_OPT_THREADS
+  cinfo->master->par_scan_replay = FALSE;
+#endif
   cinfo->master->trellis_passes =
     master->pass_number < master->pass_number_scan_opt_base;
 
@@ -645,8 +649,24 @@ prepare_for_pass(j_compress_ptr cinfo)
 #ifdef ENTROPY_OPT_SUPPORTED
   case huff_opt_pass:
     /* Do Huffman optimization for a scan after the first one. */
+#ifdef WITH_SCAN_OPT_THREADS
+    /* The coefficient buffer is final once the scan-optimization passes
+     * begin, so the candidate scans can be encoded ahead of time on worker
+     * threads.
+     */
+    if (cinfo->master->optimize_scans && !master->par_attempted &&
+        master->pass_number >= master->pass_number_scan_opt_base) {
+      master->par_attempted = TRUE;
+      jpeg_par_scan_opt_run(cinfo);
+    }
+#endif
     select_scan_parameters(cinfo);
     per_scan_setup(cinfo);
+#ifdef WITH_SCAN_OPT_THREADS
+    if (cinfo->master->optimize_scans)
+      cinfo->master->par_scan_replay =
+        jpeg_par_scan_replay_active(cinfo, master->scan_number);
+#endif
     if (cinfo->Ss != 0 || cinfo->Ah == 0 || cinfo->arith_code ||
         cinfo->master->lossless) {
       (*cinfo->entropy->start_pass) (cinfo, TRUE);
@@ -663,11 +683,37 @@ prepare_for_pass(j_compress_ptr cinfo)
     FALLTHROUGH                 /*FALLTHROUGH*/
   case output_pass:
     /* Do a data-output pass. */
+#ifdef WITH_SCAN_OPT_THREADS
+    /* When there are no Huffman optimization passes (arithmetic coding or
+     * fixed Huffman tables), the first scan-optimization pass is a
+     * data-output pass, so the candidate scans are precomputed here.
+     */
+    if (cinfo->master->optimize_scans && !master->par_attempted &&
+        master->pass_number >= master->pass_number_scan_opt_base) {
+      master->par_attempted = TRUE;
+      jpeg_par_scan_opt_run(cinfo);
+    }
+#endif
     /* We need not repeat per-scan setup if prior optimization pass did it. */
     if (!cinfo->optimize_coding) {
       select_scan_parameters(cinfo);
       per_scan_setup(cinfo);
     }
+#ifdef WITH_SCAN_OPT_THREADS
+    if (cinfo->master->optimize_scans)
+      cinfo->master->par_scan_replay =
+        jpeg_par_scan_replay_active(cinfo, master->scan_number);
+    if (cinfo->master->par_scan_replay) {
+      /* The scan was encoded ahead of time (jcparopt.c): leave the
+       * destination alone, do not emit headers (the precomputed buffer
+       * contains them), and let the passes run as no-ops.
+       */
+      (*cinfo->entropy->start_pass) (cinfo, FALSE);
+      (*cinfo->coef->start_pass) (cinfo, JBUF_CRANK_DEST);
+      master->pub.call_pass_startup = FALSE;
+      break;
+    }
+#endif
     if (cinfo->master->optimize_scans) {
       master->saved_dest = cinfo->dest;
       cinfo->dest = NULL;
@@ -958,6 +1004,9 @@ select_scans (j_compress_ptr cinfo, int next_scan_number)
     for (i = 0; i < cinfo->num_scans; i++)
       if (master->scan_buffer[i])
         free(master->scan_buffer[i]);
+#ifdef WITH_SCAN_OPT_THREADS
+    jpeg_par_scan_opt_cleanup(cinfo);
+#endif
   }
 }
 
@@ -1080,7 +1129,13 @@ finish_pass_master(j_compress_ptr cinfo)
 
   /* The entropy coder always needs an end-of-pass call,
    * either to analyze statistics or to flush its output buffer.
+   * (Not when replaying a precomputed scan, though: nothing was encoded,
+   * and the arithmetic coder's end-of-pass call would flush termination
+   * bytes into the destination.)
    */
+#ifdef WITH_SCAN_OPT_THREADS
+  if (!cinfo->master->par_scan_replay)
+#endif
   (*cinfo->entropy->finish_pass) (cinfo);
 
   /* Update state for next pass */
@@ -1101,6 +1156,9 @@ finish_pass_master(j_compress_ptr cinfo)
     /* next pass is always output of current scan */
     master->pass_type = (master->pass_number < master->pass_number_scan_opt_base-1) ? trellis_pass : output_pass;
     if (master->pass_type == output_pass && cinfo->master->optimize_scans &&
+#ifdef WITH_SCAN_OPT_THREADS
+        !cinfo->master->par_scan_replay &&
+#endif
         !cinfo->arith_code && scan_emit_provably_useless(cinfo)) {
       /* Record the scan's size lower bound in place of its actual size and
        * skip the data-output pass, mirroring what the output_pass case
@@ -1125,8 +1183,15 @@ finish_pass_master(j_compress_ptr cinfo)
     if (cinfo->optimize_coding)
       master->pass_type = huff_opt_pass;
     if (cinfo->master->optimize_scans) {
-      (*cinfo->dest->term_destination)(cinfo);
-      cinfo->dest = master->saved_dest;
+#ifdef WITH_SCAN_OPT_THREADS
+      if (cinfo->master->par_scan_replay)
+        jpeg_par_scan_install(cinfo, master->scan_number);
+      else
+#endif
+      {
+        (*cinfo->dest->term_destination)(cinfo);
+        cinfo->dest = master->saved_dest;
+      }
       select_scans(cinfo, master->scan_number + 1);
     }
 
@@ -1178,6 +1243,12 @@ jinit_c_master_control(j_compress_ptr cinfo, boolean transcode_only)
   master->pub.finish_pass = finish_pass_master;
   master->pub.is_last_pass = FALSE;
   master->pub.call_pass_startup = FALSE;
+
+#ifdef WITH_SCAN_OPT_THREADS
+  master->par_attempted = FALSE;
+  cinfo->master->par_scan_opt = NULL;
+  cinfo->master->par_scan_replay = FALSE;
+#endif
 
   if (cinfo->scan_info != NULL) {
 #ifdef NEED_SCAN_SCRIPT
@@ -1273,3 +1344,20 @@ jinit_c_master_control(j_compress_ptr cinfo, boolean transcode_only)
       master->scan_buffer[i] = NULL;
   }
 }
+
+
+#ifdef WITH_SCAN_OPT_THREADS
+
+/*
+ * Expose per_scan_setup() to the multithreaded candidate-scan evaluation
+ * (jcparopt.c), which performs the equivalent of select_scan_parameters()
+ * on its private compression objects.
+ */
+
+GLOBAL(void)
+jpeg_par_per_scan_setup(j_compress_ptr cinfo)
+{
+  per_scan_setup(cinfo);
+}
+
+#endif

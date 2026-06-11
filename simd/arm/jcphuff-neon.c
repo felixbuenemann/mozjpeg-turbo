@@ -29,9 +29,60 @@
 #include "../../jdct.h"
 #include "../../jsimddct.h"
 #include "../jsimd.h"
+#include "align.h"
 #include "neon-compat.h"
 
 #include <arm_neon.h>
+
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+
+/* Table of byte offsets, within an 8x8 block of DCT coefficients, of the
+ * coefficients in zigzag scan order: entries 2*k and 2*k + 1 hold the offsets
+ * of the two bytes of the coefficient at jpeg_natural_order[k].  This allows
+ * the AC coefficients of a scan band to be loaded with byte table lookups
+ * (TBL), as in jchuff-neon.c, instead of with per-lane loads.  The 255
+ * padding entries are out-of-range TBL indices, which gather 0, and allow
+ * whole 16-byte index vectors to be loaded at any AC scan band offset
+ * (jpeg_natural_order_start = jpeg_natural_order + Ss with 1 <= Ss <= 63.)
+ */
+ALIGN(16) static const uint8_t jsimd_zigzag_byte_offsets[2 * DCTSIZE2 + 32] = {
+    0,   1,   2,   3,  16,  17,  32,  33,
+   18,  19,   4,   5,   6,   7,  20,  21,
+   34,  35,  48,  49,  64,  65,  50,  51,
+   36,  37,  22,  23,   8,   9,  10,  11,
+   24,  25,  38,  39,  52,  53,  66,  67,
+   80,  81,  96,  97,  82,  83,  68,  69,
+   54,  55,  40,  41,  26,  27,  12,  13,
+   14,  15,  28,  29,  42,  43,  56,  57,
+   70,  71,  84,  85,  98,  99, 112, 113,
+  114, 115, 100, 101,  86,  87,  72,  73,
+   58,  59,  44,  45,  30,  31,  46,  47,
+   60,  61,  74,  75,  88,  89, 102, 103,
+  116, 117, 118, 119, 104, 105,  90,  91,
+   76,  77,  62,  63,  78,  79,  92,  93,
+  106, 107, 120, 121, 122, 123, 108, 109,
+   94,  95, 110, 111, 124, 125, 126, 127,
+  255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255
+};
+
+/* Gather eight 16-bit coefficients, whose byte offsets are held in idx, from
+ * the 8x8 block of DCT coefficients held in block_lo (rows 0-3) and block_hi
+ * (rows 4-7.)  Byte offsets >= 128 (the padding entries above) gather 0.
+ */
+static INLINE int16x8_t jsimd_gather_coefs(uint8x16x4_t block_lo,
+                                           uint8x16x4_t block_hi,
+                                           uint8x16_t idx)
+{
+  uint8x16_t lo_bytes = vqtbl4q_u8(block_lo, idx);
+  uint8x16_t hi_bytes = vqtbl4q_u8(block_hi, vsubq_u8(idx, vdupq_n_u8(64)));
+  return vreinterpretq_s16_u8(vorrq_u8(lo_bytes, hi_bytes));
+}
+
+#endif
 
 
 /* Data preparation for encode_mcu_AC_first().
@@ -44,6 +95,95 @@ void jsimd_encode_mcu_AC_first_prepare_neon
   (const JCOEF *block, const int *jpeg_natural_order_start, int Sl, int Al,
    UJCOEF *values, size_t *zerobits)
 {
+#if defined(__aarch64__) || defined(_M_ARM64)
+
+  const uint8_t *zigzag_byte_offsets = jsimd_zigzag_byte_offsets +
+    2 * (size_t)(jpeg_natural_order_start - jpeg_natural_order);
+  const int16x8_t neg_al = vdupq_n_s16(-Al);
+  const int groups = (Sl + 15) / 16;
+  int i;
+
+#ifdef HAVE_VLD1Q_U8_X4
+  const uint8x16x4_t block_lo = vld1q_u8_x4((const uint8_t *)block);
+  const uint8x16x4_t block_hi =
+    vld1q_u8_x4((const uint8_t *)block + DCTSIZE2);
+#else
+  const uint8x16x4_t block_lo = { {
+    vld1q_u8((const uint8_t *)block),
+    vld1q_u8((const uint8_t *)block + 16),
+    vld1q_u8((const uint8_t *)block + 32),
+    vld1q_u8((const uint8_t *)block + 48)
+  } };
+  const uint8x16x4_t block_hi = { {
+    vld1q_u8((const uint8_t *)block + 64),
+    vld1q_u8((const uint8_t *)block + 80),
+    vld1q_u8((const uint8_t *)block + 96),
+    vld1q_u8((const uint8_t *)block + 112)
+  } };
+#endif
+
+  /* { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 } */
+  const uint8x8_t bitmap_mask =
+    vreinterpret_u8_u64(vmov_n_u64(0x8040201008040201));
+  /* Level-1 bitmap value of a group of 16 zero coefficients */
+  const uint8x8_t all_zero_eq0_bits = vpadd_u8(bitmap_mask, bitmap_mask);
+  uint8x8_t eq0_bits[4] = {
+    all_zero_eq0_bits, all_zero_eq0_bits, all_zero_eq0_bits, all_zero_eq0_bits
+  };
+
+  for (i = 0; i < groups; i++) {
+    uint8x16_t idx1 = vld1q_u8(zigzag_byte_offsets + 32 * i);
+    uint8x16_t idx2 = vld1q_u8(zigzag_byte_offsets + 32 * i + 16);
+    int16x8_t coefs1 = jsimd_gather_coefs(block_lo, block_hi, idx1);
+    int16x8_t coefs2 = jsimd_gather_coefs(block_lo, block_hi, idx2);
+
+    /* Isolate sign of coefficients. */
+    uint16x8_t sign_coefs1 = vreinterpretq_u16_s16(vshrq_n_s16(coefs1, 15));
+    uint16x8_t sign_coefs2 = vreinterpretq_u16_s16(vshrq_n_s16(coefs2, 15));
+    /* Compute absolute value of coefficients and apply point transform Al. */
+    uint16x8_t abs_coefs1 = vreinterpretq_u16_s16(vabsq_s16(coefs1));
+    uint16x8_t abs_coefs2 = vreinterpretq_u16_s16(vabsq_s16(coefs2));
+    abs_coefs1 = vshlq_u16(abs_coefs1, neg_al);
+    abs_coefs2 = vshlq_u16(abs_coefs2, neg_al);
+
+    /* Compute diff values. */
+    uint16x8_t diff1 = veorq_u16(abs_coefs1, sign_coefs1);
+    uint16x8_t diff2 = veorq_u16(abs_coefs2, sign_coefs2);
+
+    /* Store transformed coefficients and diff values. */
+    vst1q_u16(values + 16 * i, abs_coefs1);
+    vst1q_u16(values + 16 * i + DCTSIZE, abs_coefs2);
+    vst1q_u16(values + DCTSIZE2 + 16 * i, diff1);
+    vst1q_u16(values + DCTSIZE2 + 16 * i + DCTSIZE, diff2);
+
+    /* Accumulate the zerobits bitmap in registers.  (values beyond Sl,
+     * which the table-based gather may have filled in within the last
+     * group, are masked off below and never stored or read.)
+     */
+    {
+      uint8x8_t eq0_1 = vmovn_u16(vceqq_u16(abs_coefs1, vdupq_n_u16(0)));
+      uint8x8_t eq0_2 = vmovn_u16(vceqq_u16(abs_coefs2, vdupq_n_u16(0)));
+
+      eq0_bits[i] = vpadd_u8(vand_u8(eq0_1, bitmap_mask),
+                             vand_u8(eq0_2, bitmap_mask));
+    }
+  }
+
+  /* Construct zerobits bitmap.  A set bit means that the corresponding
+   * coefficient != 0.
+   */
+  {
+    uint8x8_t bitmap_rows_0123 = vpadd_u8(eq0_bits[0], eq0_bits[1]);
+    uint8x8_t bitmap_rows_4567 = vpadd_u8(eq0_bits[2], eq0_bits[3]);
+    uint8x8_t bitmap_all = vpadd_u8(bitmap_rows_0123, bitmap_rows_4567);
+    uint64_t bitmap = vget_lane_u64(vreinterpret_u64_u8(bitmap_all), 0);
+
+    /* Store zerobits bitmap, masking off any bits beyond the scan band. */
+    *zerobits = ~bitmap & (((uint64_t)1 << Sl) - 1);
+  }
+
+#else
+
   UJCOEF *values_ptr = values;
   UJCOEF *diff_values_ptr = values + DCTSIZE2;
 
@@ -251,18 +391,13 @@ void jsimd_encode_mcu_AC_first_prepare_neon
   uint8x8_t bitmap_rows_4567 = vpadd_u8(bitmap_rows_45, bitmap_rows_67);
   uint8x8_t bitmap_all = vpadd_u8(bitmap_rows_0123, bitmap_rows_4567);
 
-#if defined(__aarch64__) || defined(_M_ARM64)
-  /* Move bitmap to a 64-bit scalar register. */
-  uint64_t bitmap = vget_lane_u64(vreinterpret_u64_u8(bitmap_all), 0);
-  /* Store zerobits bitmap. */
-  *zerobits = ~bitmap;
-#else
   /* Move bitmap to two 32-bit scalar registers. */
   uint32_t bitmap0 = vget_lane_u32(vreinterpret_u32_u8(bitmap_all), 0);
   uint32_t bitmap1 = vget_lane_u32(vreinterpret_u32_u8(bitmap_all), 1);
   /* Store zerobits bitmap. */
   zerobits[0] = ~bitmap0;
   zerobits[1] = ~bitmap1;
+
 #endif
 }
 
@@ -282,6 +417,77 @@ int jsimd_encode_mcu_AC_refine_prepare_neon
    */
   uint8_t coef_sign_bits[64];
   uint8_t coef_eq1_bits[64];
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+
+  const uint8_t *zigzag_byte_offsets = jsimd_zigzag_byte_offsets +
+    2 * (size_t)(jpeg_natural_order_start - jpeg_natural_order);
+  const int16x8_t neg_al = vdupq_n_s16(-Al);
+  const int groups = (Sl + 15) / 16;
+  int i;
+
+#ifdef HAVE_VLD1Q_U8_X4
+  const uint8x16x4_t block_lo = vld1q_u8_x4((const uint8_t *)block);
+  const uint8x16x4_t block_hi =
+    vld1q_u8_x4((const uint8_t *)block + DCTSIZE2);
+#else
+  const uint8x16x4_t block_lo = { {
+    vld1q_u8((const uint8_t *)block),
+    vld1q_u8((const uint8_t *)block + 16),
+    vld1q_u8((const uint8_t *)block + 32),
+    vld1q_u8((const uint8_t *)block + 48)
+  } };
+  const uint8x16x4_t block_hi = { {
+    vld1q_u8((const uint8_t *)block + 64),
+    vld1q_u8((const uint8_t *)block + 80),
+    vld1q_u8((const uint8_t *)block + 96),
+    vld1q_u8((const uint8_t *)block + 112)
+  } };
+#endif
+
+  for (i = 0; i < groups; i++) {
+    uint8x16_t idx1 = vld1q_u8(zigzag_byte_offsets + 32 * i);
+    uint8x16_t idx2 = vld1q_u8(zigzag_byte_offsets + 32 * i + 16);
+    int16x8_t coefs1 = jsimd_gather_coefs(block_lo, block_hi, idx1);
+    int16x8_t coefs2 = jsimd_gather_coefs(block_lo, block_hi, idx2);
+
+    /* Compute and store data for signbits bitmap. */
+    uint8x8_t sign_coefs1 =
+      vmovn_u16(vreinterpretq_u16_s16(vshrq_n_s16(coefs1, 15)));
+    uint8x8_t sign_coefs2 =
+      vmovn_u16(vreinterpretq_u16_s16(vshrq_n_s16(coefs2, 15)));
+    vst1_u8(coef_sign_bits + 16 * i, sign_coefs1);
+    vst1_u8(coef_sign_bits + 16 * i + DCTSIZE, sign_coefs2);
+
+    /* Compute absolute value of coefficients and apply point transform Al. */
+    uint16x8_t abs_coefs1 = vreinterpretq_u16_s16(vabsq_s16(coefs1));
+    uint16x8_t abs_coefs2 = vreinterpretq_u16_s16(vabsq_s16(coefs2));
+    abs_coefs1 = vshlq_u16(abs_coefs1, neg_al);
+    abs_coefs2 = vshlq_u16(abs_coefs2, neg_al);
+    vst1q_u16(absvalues + 16 * i, abs_coefs1);
+    vst1q_u16(absvalues + 16 * i + DCTSIZE, abs_coefs2);
+
+    /* Test whether transformed coefficient values == 1 (used to find EOB
+     * position.)
+     */
+    uint8x8_t coefs_eq11 = vmovn_u16(vceqq_u16(abs_coefs1, vdupq_n_u16(1)));
+    uint8x8_t coefs_eq12 = vmovn_u16(vceqq_u16(abs_coefs2, vdupq_n_u16(1)));
+    vst1_u8(coef_eq1_bits + 16 * i, coefs_eq11);
+    vst1_u8(coef_eq1_bits + 16 * i + DCTSIZE, coefs_eq12);
+  }
+
+  /* Zero remaining memory in blocks.  (Values beyond Sl that the gather
+   * filled in within the last group are masked out of the zerobits and EOB
+   * bitmaps below; absvalues beyond Sl are only read for coefficients whose
+   * zerobits bit is set.)
+   */
+  for (i = 16 * groups; i < DCTSIZE2; i += DCTSIZE) {
+    vst1q_u16(absvalues + i, vdupq_n_u16(0));
+    vst1_u8(coef_sign_bits + i, vdup_n_u8(0));
+    vst1_u8(coef_eq1_bits + i, vdup_n_u8(0));
+  }
+
+#else
 
   UJCOEF *absvalues_ptr = absvalues;
   uint8_t *coef_sign_bits_ptr = coef_sign_bits;
@@ -471,6 +677,8 @@ int jsimd_encode_mcu_AC_refine_prepare_neon
     eq1_bits_ptr += 8;
   }
 
+#endif
+
   /* Construct zerobits bitmap. */
   uint16x8_t abs_row0 = vld1q_u16(absvalues + 0 * DCTSIZE);
   uint16x8_t abs_row1 = vld1q_u16(absvalues + 1 * DCTSIZE);
@@ -514,8 +722,10 @@ int jsimd_encode_mcu_AC_refine_prepare_neon
 #if defined(__aarch64__) || defined(_M_ARM64)
   /* Move bitmap to a 64-bit scalar register. */
   uint64_t bitmap = vget_lane_u64(vreinterpret_u64_u8(bitmap_all), 0);
-  /* Store zerobits bitmap. */
-  bits[0] = ~bitmap;
+  /* Store zerobits bitmap, masking off any bits beyond the scan band that
+   * the table-based gather may have filled in.
+   */
+  bits[0] = ~bitmap & (((uint64_t)1 << Sl) - 1);
 #else
   /* Move bitmap to two 32-bit scalar registers. */
   uint32_t bitmap0 = vget_lane_u32(vreinterpret_u32_u8(bitmap_all), 0);
@@ -596,8 +806,11 @@ int jsimd_encode_mcu_AC_refine_prepare_neon
   bitmap_all = vpadd_u8(bitmap_rows_0123, bitmap_rows_4567);
 
 #if defined(__aarch64__) || defined(_M_ARM64)
-  /* Move bitmap to a 64-bit scalar register. */
-  bitmap = vget_lane_u64(vreinterpret_u64_u8(bitmap_all), 0);
+  /* Move bitmap to a 64-bit scalar register, masking off any bits beyond
+   * the scan band that the table-based gather may have filled in.
+   */
+  bitmap = vget_lane_u64(vreinterpret_u64_u8(bitmap_all), 0) &
+           (((uint64_t)1 << Sl) - 1);
 
   /* Return EOB position. */
   if (bitmap == 0) {

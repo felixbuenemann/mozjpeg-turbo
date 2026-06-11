@@ -681,6 +681,14 @@ prepare_for_pass(j_compress_ptr cinfo)
         jpeg_fold_inject_counts(cinfo);
         cinfo->master->fold_replay = TRUE;
       }
+#ifdef WITH_SCAN_OPT_THREADS
+      else if (jpeg_par_gather_pass(cinfo)) {
+        /* The single-component scan's statistics were gathered on worker
+         * threads and installed; let the pass run as a no-op.
+         */
+        cinfo->master->fold_replay = TRUE;
+      }
+#endif
       master->pub.call_pass_startup = FALSE;
       break;
     }
@@ -737,6 +745,14 @@ prepare_for_pass(j_compress_ptr cinfo)
     if (master->scan_number == 0)
       (*cinfo->marker->write_frame_header) (cinfo);
     (*cinfo->marker->write_scan_header) (cinfo);
+#ifdef WITH_SCAN_OPT_THREADS
+    if (jpeg_par_emit_pass(cinfo)) {
+      /* The scan body was encoded on worker threads and has been written;
+       * let the pass run as a no-op.
+       */
+      cinfo->master->fold_replay = TRUE;
+    }
+#endif
     master->pub.call_pass_startup = FALSE;
     break;
   case trellis_pass:
@@ -1382,6 +1398,7 @@ jinit_c_master_control(j_compress_ptr cinfo, boolean transcode_only)
   cinfo->master->trellis_pass_final = FALSE;
   cinfo->master->fold_counts_ready = FALSE;
   cinfo->master->fold_replay = FALSE;
+  cinfo->master->par_backend_pass = -1;
 #if BITS_IN_JSAMPLE == 8
   if (!transcode_only && cinfo->master->trellis_quant &&
       cinfo->optimize_coding && !cinfo->arith_code &&

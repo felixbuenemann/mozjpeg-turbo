@@ -812,6 +812,97 @@ finish_pass_huff(j_compress_ptr cinfo)
 
 
 /*
+ * Seed the DC predictors of the current scan.  Used by the multithreaded
+ * data-output pass (jcparopt.c): a band that does not start at the
+ * beginning of the scan predicts from the last block preceding it.
+ */
+
+GLOBAL(void)
+jpeg_huff_seed_dc(j_compress_ptr cinfo, const int *last_dc_vals)
+{
+  huff_entropy_ptr entropy = (huff_entropy_ptr)cinfo->entropy;
+  int ci;
+
+  for (ci = 0; ci < cinfo->comps_in_scan; ci++)
+    entropy->saved.last_dc_val[ci] = last_dc_vals[ci];
+}
+
+
+/*
+ * Flush the complete bytes of the pending bit buffer to the destination
+ * (with 0xFF stuffing), but unlike flush_bits() do not pad the remaining
+ * 0..7 bits to a byte boundary: return their count and store them in
+ * *partial (in stream order, first bit in the most significant of the
+ * returned bits.)  Used by the multithreaded data-output pass: the
+ * trailing bits of a band become the leading bits of the following band
+ * in the stitched scan.
+ */
+
+GLOBAL(int)
+jpeg_huff_flush_partial(j_compress_ptr cinfo, unsigned int *partial)
+{
+  huff_entropy_ptr entropy = (huff_entropy_ptr)cinfo->entropy;
+  struct jpeg_destination_mgr *dest = cinfo->dest;
+  simd_bit_buf_type put_buffer;
+  int put_bits;
+
+#ifdef WITH_SIMD
+  if (entropy->simd) {
+    if (entropy->saved.free_bits < 0)
+      ERREXIT(cinfo, JERR_BAD_DCT_COEF);
+#if defined(__aarch64__) && !defined(NEON_INTRINSICS)
+    put_bits = entropy->saved.free_bits;
+#else
+    put_bits = SIMD_BIT_BUF_SIZE - entropy->saved.free_bits;
+#endif
+    put_buffer = entropy->saved.put_buffer.simd;
+  } else
+#endif
+  {
+    put_bits = BIT_BUF_SIZE - entropy->saved.free_bits;
+    put_buffer = entropy->saved.put_buffer.c;
+  }
+
+  while (put_bits >= 8) {
+    JOCTET temp;
+
+    put_bits -= 8;
+    temp = (JOCTET)(put_buffer >> put_bits);
+    *dest->next_output_byte++ = temp;
+    if (--dest->free_in_buffer == 0)
+      if (!(*dest->empty_output_buffer) (cinfo))
+        ERREXIT(cinfo, JERR_CANT_SUSPEND);
+    if (temp == 0xFF) {         /* stuff a zero byte */
+      *dest->next_output_byte++ = 0;
+      if (--dest->free_in_buffer == 0)
+        if (!(*dest->empty_output_buffer) (cinfo))
+          ERREXIT(cinfo, JERR_CANT_SUSPEND);
+    }
+  }
+  *partial = put_bits ?
+    (unsigned int)(put_buffer & (((simd_bit_buf_type)1 << put_bits) - 1)) :
+    0;
+
+  /* Reset the bit buffer to empty */
+#ifdef WITH_SIMD
+  if (entropy->simd) {
+    entropy->saved.put_buffer.simd = 0;
+#if defined(__aarch64__) && !defined(NEON_INTRINSICS)
+    entropy->saved.free_bits = 0;
+#else
+    entropy->saved.free_bits = SIMD_BIT_BUF_SIZE;
+#endif
+  } else
+#endif
+  {
+    entropy->saved.put_buffer.c = 0;
+    entropy->saved.free_bits = BIT_BUF_SIZE;
+  }
+  return put_bits;
+}
+
+
+/*
  * Huffman coding optimization.
  *
  * We first scan the supplied data and count the number of uses of each symbol
@@ -1087,6 +1178,26 @@ jpeg_fold_inject_counts(j_compress_ptr cinfo)
            cinfo->master->fold_ac_counts[compptr->ac_tbl_no],
            257 * sizeof(long));
   }
+}
+
+
+/*
+ * Install externally accumulated symbol counts as the current
+ * single-component scan's statistics (used by the multithreaded
+ * statistics-gathering pass in jcparopt.c.)
+ */
+
+GLOBAL(void)
+jpeg_gather_set_counts(j_compress_ptr cinfo, const long *dc_counts,
+                       const long *ac_counts)
+{
+  huff_entropy_ptr entropy = (huff_entropy_ptr)cinfo->entropy;
+  jpeg_component_info *compptr = cinfo->cur_comp_info[0];
+
+  memcpy(entropy->dc_count_ptrs[compptr->dc_tbl_no], dc_counts,
+         257 * sizeof(long));
+  memcpy(entropy->ac_count_ptrs[compptr->ac_tbl_no], ac_counts,
+         257 * sizeof(long));
 }
 
 

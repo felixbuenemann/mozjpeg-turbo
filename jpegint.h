@@ -159,6 +159,11 @@ struct jpeg_comp_master {
   long *fold_ac_counts[NUM_HUFF_TBLS]; /*   by table number */
   int fold_last_dc[MAX_COMPONENTS];    /* per-component DC predictors */
 
+  int par_backend_pass;    /* pass number of the trellis pass that already
+                              ran on worker threads, or -1 (only used when
+                              the library is built with
+                              WITH_SCAN_OPT_THREADS) [not exposed] */
+
   float lambda_log_scale1;
   float lambda_log_scale2;
   
@@ -678,6 +683,11 @@ EXTERN(void) jpeg_par_scan_install(j_compress_ptr cinfo, int scan_number);
 EXTERN(void) jpeg_par_scan_opt_cleanup(j_compress_ptr cinfo);
 EXTERN(void) jpeg_par_per_scan_setup(j_compress_ptr cinfo);
 EXTERN(jvirt_barray_ptr *) jpeg_par_coef_arrays(j_compress_ptr cinfo);
+EXTERN(jvirt_barray_ptr *) jpeg_par_coef_arrays_uq(j_compress_ptr cinfo);
+EXTERN(boolean) jpeg_par_trellis_pass(j_compress_ptr cinfo,
+                                      JDIMENSION iMCU_row_num);
+EXTERN(boolean) jpeg_par_gather_pass(j_compress_ptr cinfo);
+EXTERN(boolean) jpeg_par_emit_pass(j_compress_ptr cinfo);
 #endif
 
 EXTERN(void)
@@ -692,6 +702,12 @@ EXTERN(void) jpeg_fold_count_block(j_compress_ptr cinfo, JCOEFPTR block,
                                    int last_dc_val, long dc_counts[],
                                    long ac_counts[]);
 EXTERN(void) jpeg_fold_inject_counts(j_compress_ptr cinfo);
+EXTERN(void) jpeg_gather_set_counts(j_compress_ptr cinfo,
+                                    const long *dc_counts,
+                                    const long *ac_counts);
+EXTERN(void) jpeg_huff_seed_dc(j_compress_ptr cinfo, const int *last_dc_vals);
+EXTERN(int) jpeg_huff_flush_partial(j_compress_ptr cinfo,
+                                    unsigned int *partial);
 
 /* Utility routines in jutils.c */
 EXTERN(long) jdiv_round_up(long a, long b);

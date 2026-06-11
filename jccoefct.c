@@ -357,26 +357,34 @@ METHODDEF(boolean)
 compress_trellis_pass (j_compress_ptr cinfo, JSAMPIMAGE input_buf)
 {
   my_coef_ptr coef = (my_coef_ptr) cinfo->coef;
-  JDIMENSION last_iMCU_row = cinfo->total_iMCU_rows - 1;
-  JDIMENSION blocks_across, MCUs_across, MCUindex;
-  int bi, ci, h_samp_factor, block_row, block_rows, ndummy;
-  JCOEF lastDC;
+  int ci;
+  boolean trellis_done = FALSE;
   jpeg_component_info *compptr;
   JBLOCKARRAY buffer;
-  JBLOCKROW thisblockrow, lastblockrow;
   JBLOCKARRAY buffer_dst;
 
-  for (ci = 0; ci < cinfo->comps_in_scan; ci++) {
+#ifdef WITH_SCAN_OPT_THREADS
+  /* On the first iMCU row of the pass, try to requantize the whole pass on
+   * worker threads (jcparopt.c); when that succeeds, the per-row calls only
+   * have to take care of the statistics gathering below.
+   */
+  trellis_done = jpeg_par_trellis_pass(cinfo, coef->iMCU_row_num);
+#endif
+
+  for (ci = 0; ci < cinfo->comps_in_scan && !trellis_done; ci++) {
     c_derived_tbl dctbl_data;
     c_derived_tbl *dctbl = &dctbl_data;
     c_derived_tbl actbl_data;
     c_derived_tbl *actbl = &actbl_data;
-    
+    boolean fold;
+
 #ifdef C_ARITH_CODING_SUPPORTED
     arith_rates arith_r_data;
     arith_rates *arith_r = &arith_r_data;
+#else
+    void *arith_r = NULL;
 #endif
-    
+
     compptr = cinfo->cur_comp_info[ci];
 
 #ifdef C_ARITH_CODING_SUPPORTED
@@ -394,139 +402,23 @@ compress_trellis_pass (j_compress_ptr cinfo, JSAMPIMAGE input_buf)
     ((j_common_ptr) cinfo, coef->whole_image[compptr->component_index],
      coef->iMCU_row_num * compptr->v_samp_factor,
      (JDIMENSION)compptr->v_samp_factor, TRUE);
-    
+
     buffer_dst = (*cinfo->mem->access_virt_barray)
     ((j_common_ptr) cinfo, coef->whole_image_uq[compptr->component_index],
      coef->iMCU_row_num * compptr->v_samp_factor,
      (JDIMENSION)compptr->v_samp_factor, TRUE);
-    
-    /* Count non-dummy DCT block rows in this iMCU row. */
-    if (coef->iMCU_row_num < last_iMCU_row)
-      block_rows = compptr->v_samp_factor;
-    else {
-      /* NB: can't use last_row_height here, since may not be set! */
-      block_rows = (int) (compptr->height_in_blocks % compptr->v_samp_factor);
-      if (block_rows == 0) block_rows = compptr->v_samp_factor;
-    }
-    blocks_across = compptr->width_in_blocks;
-    h_samp_factor = compptr->h_samp_factor;
-    /* Count number of dummy blocks to be added at the right margin. */
-    ndummy = (int) (blocks_across % h_samp_factor);
-    if (ndummy > 0)
-      ndummy = h_samp_factor - ndummy;
-    
-    lastDC = 0;
 
-    /* Perform DCT for all non-dummy blocks in this iMCU row.  Each call
-     * on forward_DCT processes a complete horizontal row of DCT blocks.
-     */
-    for (block_row = 0; block_row < block_rows; block_row++) {
-      thisblockrow = buffer[block_row];
-      lastblockrow = (block_row > 0) ? buffer[block_row-1] : NULL;
-#ifdef C_ARITH_CODING_SUPPORTED
-      if (cinfo->arith_code)
-        quantize_trellis_arith(cinfo, arith_r, thisblockrow,
-                               buffer_dst[block_row], blocks_across,
-                               cinfo->quant_tbl_ptrs[compptr->quant_tbl_no],
-                               cinfo->master->norm_src[compptr->quant_tbl_no],
-                               cinfo->master->norm_coef[compptr->quant_tbl_no],
-                               &lastDC, lastblockrow, buffer_dst[block_row-1]);
-      else
-#endif
-        quantize_trellis(cinfo, dctbl, actbl, thisblockrow,
-                         buffer_dst[block_row], blocks_across,
-                         cinfo->quant_tbl_ptrs[compptr->quant_tbl_no],
-                         cinfo->master->norm_src[compptr->quant_tbl_no],
-                         cinfo->master->norm_coef[compptr->quant_tbl_no],
-                         &lastDC, lastblockrow, buffer_dst[block_row-1]);
-      
-      if (ndummy > 0) {
-        /* Create dummy blocks at the right edge of the image. */
-        thisblockrow += blocks_across; /* => first dummy block */
-        jzero_far((void *) thisblockrow, ndummy * sizeof(JBLOCK));
-        lastDC = thisblockrow[-1][0];
-        for (bi = 0; bi < ndummy; bi++) {
-          thisblockrow[bi][0] = lastDC;
-        }
-      }
-    }
-    /* If at end of image, create dummy block rows as needed.
-     * The tricky part here is that within each MCU, we want the DC values
-     * of the dummy blocks to match the last real block's DC value.
-     * This squeezes a few more bytes out of the resulting file...
-     */
-    if (coef->iMCU_row_num == last_iMCU_row) {
-      blocks_across += ndummy;  /* include lower right corner */
-      MCUs_across = blocks_across / h_samp_factor;
-      for (block_row = block_rows; block_row < compptr->v_samp_factor;
-           block_row++) {
-        thisblockrow = buffer[block_row];
-        lastblockrow = buffer[block_row-1];
-        jzero_far((void *) thisblockrow,
-                  (size_t) (blocks_across * sizeof(JBLOCK)));
-        for (MCUindex = 0; MCUindex < MCUs_across; MCUindex++) {
-          lastDC = lastblockrow[h_samp_factor-1][0];
-          for (bi = 0; bi < h_samp_factor; bi++) {
-            thisblockrow[bi][0] = lastDC;
-          }
-          thisblockrow += h_samp_factor; /* advance to next MCU in row */
-          lastblockrow += h_samp_factor;
-        }
-      }
-    }
-
-    if (cinfo->master->fold_gather && cinfo->master->trellis_pass_final) {
-      /* This is the component's last trellis pass, so its coefficients
-       * just became final: accumulate the statistics of the final
-       * sequential scan for this iMCU row while the blocks are still in
-       * cache.  The blocks are visited in the order in which the final
-       * interleaved scan encodes this component's blocks (including the
-       * dummy blocks created above), and the DC predictor is reset at the
-       * final scan's restart intervals, so the accumulated counts match
-       * those of the skipped statistics-gathering pass exactly.
-       */
-      long *dc_counts = cinfo->master->fold_dc_counts[compptr->dc_tbl_no];
-      long *ac_counts = cinfo->master->fold_ac_counts[compptr->ac_tbl_no];
-      int cindex = compptr->component_index;
-      int last_dc = cinfo->master->fold_last_dc[cindex];
-      int mcu_w, mcu_h, yindex, xindex;
-      JDIMENSION mcus_across, mcu_col;
-      unsigned int restart;
-
-      if (cinfo->num_components == 1) {
-        /* Single-component scan: one block per MCU, no dummy blocks. */
-        mcu_w = mcu_h = 1;
-        mcus_across = compptr->width_in_blocks;
-      } else {
-        mcu_w = compptr->h_samp_factor;
-        mcu_h = compptr->v_samp_factor;
-        mcus_across = (compptr->width_in_blocks + mcu_w - 1) / mcu_w;
-      }
-      /* Restart interval of the final scan, in its MCUs (the conversion
-       * from rows matches per_scan_setup() for that scan.)
-       */
-      if (cinfo->restart_in_rows > 0) {
-        long nominal = (long)cinfo->restart_in_rows * (long)mcus_across;
-        restart = (unsigned int)MIN(nominal, 65535L);
-      } else
-        restart = cinfo->restart_interval;
-
-      for (mcu_col = 0; mcu_col < mcus_across; mcu_col++) {
-        if (restart &&
-            (coef->iMCU_row_num * mcus_across + mcu_col) % restart == 0)
-          last_dc = 0;          /* DC prediction restarts with this MCU */
-        for (yindex = 0; yindex < mcu_h; yindex++) {
-          JBLOCKROW mcu_blocks = buffer[yindex] +
-                                 (JDIMENSION)mcu_col * (JDIMENSION)mcu_w;
-          for (xindex = 0; xindex < mcu_w; xindex++) {
-            jpeg_fold_count_block(cinfo, mcu_blocks[xindex], last_dc,
-                                  dc_counts, ac_counts);
-            last_dc = mcu_blocks[xindex][0];
-          }
-        }
-      }
-      cinfo->master->fold_last_dc[cindex] = last_dc;
-    }
+    fold = cinfo->master->fold_gather && cinfo->master->trellis_pass_final;
+    jpeg_trellis_imcu_row(cinfo, compptr, coef->iMCU_row_num, buffer,
+                          buffer_dst, dctbl, actbl, arith_r,
+                          fold ?
+                            cinfo->master->fold_dc_counts[compptr->dc_tbl_no] :
+                            NULL,
+                          fold ?
+                            cinfo->master->fold_ac_counts[compptr->ac_tbl_no] :
+                            NULL,
+                          &cinfo->master->fold_last_dc[compptr->component_index],
+                          FALSE, NULL, NULL);
   }
 
   if (cinfo->master->fold_gather && cinfo->master->trellis_pass_final) {
@@ -546,6 +438,193 @@ compress_trellis_pass (j_compress_ptr cinfo, JSAMPIMAGE input_buf)
 
   /* Emit data to the entropy encoder, sharing code with subsequent passes */
   return compress_output(cinfo, input_buf);
+}
+
+
+/*
+ * Requantize (and, for the component's last trellis pass, gather the folded
+ * statistics of) one iMCU row of one component.  This is the per-row body
+ * of compress_trellis_pass(), shared with the multithreaded trellis pass
+ * (jcparopt.c): everything it touches is reachable from its arguments, so
+ * the iMCU rows of a pass can be processed concurrently (the DC predictor
+ * chains and the inter-row state of quantize_trellis() stay within one iMCU
+ * row.)
+ *
+ * cinfo may be a worker's private jpeg_compress_struct; it provides the
+ * scan band (Ss/Se), data_precision, arith_code, restart parameters, the
+ * quantization tables, the (shared, read-only) master record, the entropy
+ * encoder (read only for its simd_gather flag), and the error manager.
+ *
+ * When fold_dc_counts/fold_ac_counts are non-NULL, the statistics of the
+ * final sequential scan are accumulated for this row: the blocks are
+ * visited in the order in which the final interleaved scan encodes this
+ * component's blocks (including the dummy blocks created here), and the DC
+ * predictor (*fold_last_dc, updated on return) is reset at the final scan's
+ * restart intervals, so the accumulated counts match those of the skipped
+ * statistics-gathering pass exactly.  When fold_first_unknown is TRUE (a
+ * concurrent caller does not know the DC predictor entering this row yet),
+ * the first block is counted as if its DC difference were zero, its DC
+ * value is stored in *fold_first_dc, and *fold_fixup is set to TRUE so that
+ * the caller can correct the count once the predecessor is known; if the
+ * row starts at a restart boundary, the predictor is known to be zero and
+ * *fold_fixup is set to FALSE.
+ */
+
+GLOBAL(void)
+jpeg_trellis_imcu_row(j_compress_ptr cinfo, jpeg_component_info *compptr,
+                      JDIMENSION iMCU_row_num, JBLOCKARRAY buffer,
+                      JBLOCKARRAY buffer_dst, c_derived_tbl *dctbl,
+                      c_derived_tbl *actbl, void *arith_r_param,
+                      long *fold_dc_counts, long *fold_ac_counts,
+                      int *fold_last_dc, boolean fold_first_unknown,
+                      int *fold_first_dc, boolean *fold_fixup)
+{
+  JDIMENSION last_iMCU_row = cinfo->total_iMCU_rows - 1;
+  JDIMENSION blocks_across, MCUs_across, MCUindex;
+  int bi, h_samp_factor, block_row, block_rows, ndummy;
+  JCOEF lastDC;
+  JBLOCKROW thisblockrow, lastblockrow;
+
+#ifdef C_ARITH_CODING_SUPPORTED
+  arith_rates *arith_r = (arith_rates *)arith_r_param;
+#else
+  (void)arith_r_param;
+#endif
+
+  /* Count non-dummy DCT block rows in this iMCU row. */
+  if (iMCU_row_num < last_iMCU_row)
+    block_rows = compptr->v_samp_factor;
+  else {
+    /* NB: can't use last_row_height here, since may not be set! */
+    block_rows = (int) (compptr->height_in_blocks % compptr->v_samp_factor);
+    if (block_rows == 0) block_rows = compptr->v_samp_factor;
+  }
+  blocks_across = compptr->width_in_blocks;
+  h_samp_factor = compptr->h_samp_factor;
+  /* Count number of dummy blocks to be added at the right margin. */
+  ndummy = (int) (blocks_across % h_samp_factor);
+  if (ndummy > 0)
+    ndummy = h_samp_factor - ndummy;
+
+  lastDC = 0;
+
+  for (block_row = 0; block_row < block_rows; block_row++) {
+    JBLOCKROW lastblockrow_dst;
+
+    thisblockrow = buffer[block_row];
+    /* NB: the "above" rows must not be read (not even the row pointer)
+     * for the first block row: when the rows come from a caller-built
+     * pointer array (the multithreaded trellis pass), index -1 is out of
+     * bounds.
+     */
+    lastblockrow = (block_row > 0) ? buffer[block_row-1] : NULL;
+    lastblockrow_dst = (block_row > 0) ? buffer_dst[block_row-1] : NULL;
+#ifdef C_ARITH_CODING_SUPPORTED
+    if (cinfo->arith_code)
+      quantize_trellis_arith(cinfo, arith_r, thisblockrow,
+                             buffer_dst[block_row], blocks_across,
+                             cinfo->quant_tbl_ptrs[compptr->quant_tbl_no],
+                             cinfo->master->norm_src[compptr->quant_tbl_no],
+                             cinfo->master->norm_coef[compptr->quant_tbl_no],
+                             &lastDC, lastblockrow, lastblockrow_dst);
+    else
+#endif
+      quantize_trellis(cinfo, dctbl, actbl, thisblockrow,
+                       buffer_dst[block_row], blocks_across,
+                       cinfo->quant_tbl_ptrs[compptr->quant_tbl_no],
+                       cinfo->master->norm_src[compptr->quant_tbl_no],
+                       cinfo->master->norm_coef[compptr->quant_tbl_no],
+                       &lastDC, lastblockrow, lastblockrow_dst);
+
+    if (ndummy > 0) {
+      /* Create dummy blocks at the right edge of the image. */
+      thisblockrow += blocks_across; /* => first dummy block */
+      jzero_far((void *) thisblockrow, ndummy * sizeof(JBLOCK));
+      lastDC = thisblockrow[-1][0];
+      for (bi = 0; bi < ndummy; bi++) {
+        thisblockrow[bi][0] = lastDC;
+      }
+    }
+  }
+  /* If at end of image, create dummy block rows as needed.
+   * The tricky part here is that within each MCU, we want the DC values
+   * of the dummy blocks to match the last real block's DC value.
+   * This squeezes a few more bytes out of the resulting file...
+   */
+  if (iMCU_row_num == last_iMCU_row) {
+    blocks_across += ndummy;  /* include lower right corner */
+    MCUs_across = blocks_across / h_samp_factor;
+    for (block_row = block_rows; block_row < compptr->v_samp_factor;
+         block_row++) {
+      thisblockrow = buffer[block_row];
+      lastblockrow = buffer[block_row-1];
+      jzero_far((void *) thisblockrow,
+                (size_t) (blocks_across * sizeof(JBLOCK)));
+      for (MCUindex = 0; MCUindex < MCUs_across; MCUindex++) {
+        lastDC = lastblockrow[h_samp_factor-1][0];
+        for (bi = 0; bi < h_samp_factor; bi++) {
+          thisblockrow[bi][0] = lastDC;
+        }
+        thisblockrow += h_samp_factor; /* advance to next MCU in row */
+        lastblockrow += h_samp_factor;
+      }
+    }
+  }
+
+  if (fold_dc_counts != NULL) {
+    int last_dc = *fold_last_dc;
+    int mcu_w, mcu_h, yindex, xindex;
+    JDIMENSION mcus_across, mcu_col;
+    unsigned int restart;
+    boolean first_pending = fold_first_unknown;
+
+    if (fold_fixup != NULL)
+      *fold_fixup = FALSE;
+
+    if (cinfo->num_components == 1) {
+      /* Single-component scan: one block per MCU, no dummy blocks. */
+      mcu_w = mcu_h = 1;
+      mcus_across = compptr->width_in_blocks;
+    } else {
+      mcu_w = compptr->h_samp_factor;
+      mcu_h = compptr->v_samp_factor;
+      mcus_across = (compptr->width_in_blocks + mcu_w - 1) / mcu_w;
+    }
+    /* Restart interval of the final scan, in its MCUs (the conversion
+     * from rows matches per_scan_setup() for that scan.)
+     */
+    if (cinfo->restart_in_rows > 0) {
+      long nominal = (long)cinfo->restart_in_rows * (long)mcus_across;
+      restart = (unsigned int)MIN(nominal, 65535L);
+    } else
+      restart = cinfo->restart_interval;
+
+    for (mcu_col = 0; mcu_col < mcus_across; mcu_col++) {
+      if (restart &&
+          (iMCU_row_num * mcus_across + mcu_col) % restart == 0) {
+        last_dc = 0;            /* DC prediction restarts with this MCU */
+        first_pending = FALSE;  /* the predictor is known after all */
+      }
+      for (yindex = 0; yindex < mcu_h; yindex++) {
+        JBLOCKROW mcu_blocks = buffer[yindex] +
+                               (JDIMENSION)mcu_col * (JDIMENSION)mcu_w;
+        for (xindex = 0; xindex < mcu_w; xindex++) {
+          if (first_pending) {
+            /* Count a zero DC difference for now; the caller corrects the
+             * count once the true predecessor is known. */
+            *fold_first_dc = mcu_blocks[xindex][0];
+            *fold_fixup = TRUE;
+            last_dc = mcu_blocks[xindex][0];
+            first_pending = FALSE;
+          }
+          jpeg_fold_count_block(cinfo, mcu_blocks[xindex], last_dc,
+                                fold_dc_counts, fold_ac_counts);
+          last_dc = mcu_blocks[xindex][0];
+        }
+      }
+    }
+    *fold_last_dc = last_dc;
+  }
 }
 #endif
 
@@ -719,6 +798,23 @@ jpeg_par_coef_arrays(j_compress_ptr cinfo)
       coef->whole_image[0] == NULL)
     return NULL;
   return coef->whole_image;
+}
+
+
+/*
+ * Likewise for the unquantized coefficient arrays that the trellis passes
+ * requantize from.
+ */
+
+GLOBAL(jvirt_barray_ptr *)
+jpeg_par_coef_arrays_uq(j_compress_ptr cinfo)
+{
+  my_coef_ptr coef = (my_coef_ptr)cinfo->coef;
+
+  if (coef == NULL || (void *)coef != cinfo->master->par_coef_ctl ||
+      coef->whole_image_uq[0] == NULL)
+    return NULL;
+  return coef->whole_image_uq;
 }
 
 #endif

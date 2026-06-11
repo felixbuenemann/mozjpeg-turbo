@@ -45,5 +45,23 @@ EXTERN(void) quantize_trellis
         (j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actbl, JBLOCKROW coef_blocks, JBLOCKROW src, JDIMENSION num_blocks,
                  JQUANT_TBL * qtbl, double *norm_src, double *norm_coef, JCOEF *last_dc_val,
          JBLOCKROW coef_blocks_above, JBLOCKROW src_above);
+
+/* Requantize one iMCU row of one component (the per-row body of the
+ * trellis pass; defined in jccoefct.c and shared with the multithreaded
+ * trellis pass in jcparopt.c).  arith_r points to the arith_rates of the
+ * component when arithmetic coding is in use (NULL otherwise); it is
+ * declared as void * because the type only exists when the arithmetic
+ * encoder is compiled in.
+ */
+EXTERN(void) jpeg_trellis_imcu_row(j_compress_ptr cinfo,
+                                   jpeg_component_info *compptr,
+                                   JDIMENSION iMCU_row_num,
+                                   JBLOCKARRAY buffer, JBLOCKARRAY buffer_dst,
+                                   c_derived_tbl *dctbl, c_derived_tbl *actbl,
+                                   void *arith_r,
+                                   long *fold_dc_counts, long *fold_ac_counts,
+                                   int *fold_last_dc,
+                                   boolean fold_first_unknown,
+                                   int *fold_first_dc, boolean *fold_fixup);
 EXTERN(void) jpeg_gen_optimal_table(j_compress_ptr cinfo, JHUFF_TBL *htbl,
                                     long freq[]);

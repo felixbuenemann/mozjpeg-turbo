@@ -58,6 +58,8 @@
 #include "jinclude.h"
 #include "jpeglib.h"
 #include "jcmaster.h"
+#include "jchuff.h"
+#include "jpeg_nbits.h"
 
 #ifdef WITH_SCAN_OPT_THREADS
 
@@ -1071,5 +1073,958 @@ jpeg_par_scan_opt_cleanup(j_compress_ptr cinfo)
   free(par);
   cinfo->master->par_scan_opt = NULL;
 }
+
+
+/*
+ * Multithreaded trellis passes.
+ *
+ * A trellis pass (compress_trellis_pass() in jccoefct.c) requantizes one
+ * component's coefficients, one iMCU row at a time.  The DC predictor
+ * chains and the inter-row state of quantize_trellis() stay within one
+ * iMCU row, so the rows can be requantized concurrently; each worker
+ * processes a contiguous band of rows by calling the same per-row body
+ * (jpeg_trellis_imcu_row()) that the sequential pass uses.
+ *
+ * When the pass also performs the folded statistics gathering (the
+ * component's last trellis pass; see jccoefct.c), each worker accumulates
+ * counts into private arrays that are summed afterwards.  The DC
+ * difference of the first block of a band depends on the last block of the
+ * previous band, which another worker may not have produced yet; that
+ * single symbol is counted as a zero difference and corrected after the
+ * workers have finished.  The statistics that the trellis pass would
+ * otherwise gather for its own single-component scan are not parallelized:
+ * those passes simply run their (sequential) statistics iteration after
+ * the concurrent requantization, which keeps the entropy encoder's
+ * EOB-run and refinement state handling exact in progressive mode.
+ *
+ * The trellis search itself is deterministic and reads only its own row,
+ * so the requantized coefficients -- and therefore the compressed output --
+ * are bit-for-bit identical to those of a sequential build.  Threading is
+ * declined (and the sequential code runs unchanged) for arithmetic coding
+ * and for quantization-table optimization (trellis_q_opt), whose
+ * floating-point accumulators are order-sensitive.
+ */
+
+#if BITS_IN_JSAMPLE == 8
+
+typedef struct par_trellis_state {
+  j_compress_ptr maincinfo;
+  jpeg_component_info *compptr;
+  JBLOCKROW *rows;              /* all block rows of the component */
+  JBLOCKROW *rows_uq;
+  c_derived_tbl *dctbl, *actbl;
+  boolean fold;                 /* gather folded statistics */
+
+  /* Band assignment */
+  int nbands;
+  JDIMENSION total_imcu_rows;
+
+  /* Per-band state (band b is processed by worker b) */
+  long *band_dc_counts[PAR_MAX_THREADS];
+  long *band_ac_counts[PAR_MAX_THREADS];
+  int band_last_dc[PAR_MAX_THREADS];
+  int band_first_dc[PAR_MAX_THREADS];
+  boolean band_fixup[PAR_MAX_THREADS];
+  int band_index;               /* next band to hand out, guarded by lock */
+  pthread_mutex_t lock;
+  boolean failed;
+} par_trellis_state;
+
+
+static void
+par_trellis_band(par_trellis_state *pt, int band)
+{
+  j_compress_ptr maininfo = pt->maincinfo;
+  jpeg_component_info *compptr = pt->compptr;
+  struct jpeg_compress_struct wc;
+  par_error_mgr werr;
+  JDIMENSION r, r0, r1;
+  int v_samp = compptr->v_samp_factor;
+  int last_dc = 0;
+
+  /* Static partition of the iMCU rows into nbands contiguous bands */
+  r0 = (JDIMENSION)((double)pt->total_imcu_rows * band / pt->nbands);
+  r1 = (JDIMENSION)((double)pt->total_imcu_rows * (band + 1) / pt->nbands);
+
+  memset(&wc, 0, sizeof(wc));
+  wc.err = jpeg_std_error(&werr.pub);
+  werr.pub.error_exit = par_error_exit;
+  werr.pub.output_message = par_output_message;
+
+  if (setjmp(werr.jb)) {
+    jpeg_destroy_compress(&wc);
+    pthread_mutex_lock(&pt->lock);
+    pt->failed = TRUE;
+    pthread_mutex_unlock(&pt->lock);
+    return;
+  }
+
+  jpeg_create_compress(&wc);
+
+  /* The per-row body reads the scan band, the image geometry, the restart
+   * parameters, the quantization tables, the master record (read-only
+   * here), and -- for the folded statistics -- the entropy encoder's
+   * simd_gather flag.  Tables and records are shared with the main
+   * structure; only scalars are copied.
+   */
+  wc.image_width = maininfo->image_width;
+  wc.image_height = maininfo->image_height;
+  wc.data_precision = maininfo->data_precision;
+  wc.num_components = maininfo->num_components;
+  wc.total_iMCU_rows = maininfo->total_iMCU_rows;
+  wc.arith_code = FALSE;
+  wc.restart_interval = maininfo->restart_interval;
+  wc.restart_in_rows = maininfo->restart_in_rows;
+  wc.Ss = maininfo->Ss;
+  wc.Se = maininfo->Se;
+  wc.Ah = maininfo->Ah;
+  wc.Al = maininfo->Al;
+  memcpy(wc.quant_tbl_ptrs, maininfo->quant_tbl_ptrs,
+         sizeof(wc.quant_tbl_ptrs));
+  wc.master = maininfo->master;
+  wc.entropy = maininfo->entropy;
+
+  if (pt->fold && band == 0)
+    last_dc = maininfo->master->fold_last_dc[compptr->component_index];
+
+  for (r = r0; r < r1; r++) {
+    boolean first_unknown = pt->fold && band > 0 && r == r0;
+
+    jpeg_trellis_imcu_row(&wc, compptr, r,
+                          &pt->rows[r * v_samp], &pt->rows_uq[r * v_samp],
+                          pt->dctbl, pt->actbl, NULL,
+                          pt->fold ? pt->band_dc_counts[band] : NULL,
+                          pt->fold ? pt->band_ac_counts[band] : NULL,
+                          &last_dc, first_unknown,
+                          first_unknown ? &pt->band_first_dc[band] : NULL,
+                          first_unknown ? &pt->band_fixup[band] : NULL);
+  }
+
+  pt->band_last_dc[band] = last_dc;
+
+  jpeg_destroy_compress(&wc);
+}
+
+
+static void *
+par_trellis_worker(void *arg)
+{
+  par_trellis_state *pt = (par_trellis_state *)arg;
+
+  for (;;) {
+    int band;
+
+    pthread_mutex_lock(&pt->lock);
+    band = pt->band_index < pt->nbands ? pt->band_index++ : -1;
+    pthread_mutex_unlock(&pt->lock);
+    if (band < 0)
+      return NULL;
+    par_trellis_band(pt, band);
+  }
+}
+
+
+/*
+ * Requantize the current trellis pass's component on worker threads.
+ * Called from compress_trellis_pass() for every iMCU row; the first call
+ * does all the work, and TRUE is returned for the rest of the pass so
+ * that the caller skips its per-row requantization (its statistics
+ * gathering still runs.)  Returns FALSE if threading is unavailable or
+ * fails, in which case the caller requantizes this row exactly as a
+ * sequential build would (the requantization is idempotent, so rows a
+ * failed attempt may already have written are simply rewritten.)
+ */
+
+GLOBAL(boolean)
+jpeg_par_trellis_pass(j_compress_ptr cinfo, JDIMENSION iMCU_row_num)
+{
+  my_master_ptr master = (my_master_ptr)cinfo->master;
+  jvirt_barray_ptr *whole_image, *whole_image_uq;
+  jpeg_component_info *compptr;
+  par_trellis_state pt;
+  pthread_t tids[PAR_MAX_THREADS];
+  c_derived_tbl dctbl_data, actbl_data;
+  c_derived_tbl *dctbl = &dctbl_data, *actbl = &actbl_data;
+  JDIMENSION nrows, r;
+  int cindex, nthreads, started, i, b;
+  boolean ok = FALSE;
+
+  if (cinfo->master->par_backend_pass == master->pass_number)
+    return TRUE;                /* this pass already ran on the workers */
+
+  /* Attempt the concurrent requantization only at the start of the pass:
+   * later rows mean an earlier attempt failed (or that rows have already
+   * been processed -- and their statistics gathered -- sequentially.)
+   */
+  if (iMCU_row_num != 0)
+    return FALSE;
+
+  if (cinfo->arith_code || cinfo->master->trellis_q_opt ||
+      cinfo->master->lossless || cinfo->comps_in_scan != 1)
+    return FALSE;
+
+  nthreads = (int)par_env_number("MOZJPEG_SCAN_THREADS",
+                                 sysconf(_SC_NPROCESSORS_ONLN));
+  if (nthreads > PAR_MAX_THREADS)
+    nthreads = PAR_MAX_THREADS;
+  if (nthreads < 2)
+    return FALSE;
+
+  whole_image = jpeg_par_coef_arrays(cinfo);
+  whole_image_uq = jpeg_par_coef_arrays_uq(cinfo);
+  if (whole_image == NULL || whole_image_uq == NULL)
+    return FALSE;
+
+  compptr = cinfo->cur_comp_info[0];
+  cindex = compptr->component_index;
+  nrows = (JDIMENSION)jround_up((long)compptr->height_in_blocks,
+                                (long)compptr->v_samp_factor);
+
+  memset(&pt, 0, sizeof(pt));
+  pt.maincinfo = cinfo;
+  pt.compptr = compptr;
+  pt.total_imcu_rows = cinfo->total_iMCU_rows;
+  pt.fold = cinfo->master->fold_gather && cinfo->master->trellis_pass_final;
+  if (pthread_mutex_init(&pt.lock, NULL) != 0)
+    return FALSE;
+
+  pt.nbands = nthreads;
+  if ((JDIMENSION)pt.nbands > pt.total_imcu_rows)
+    pt.nbands = (int)pt.total_imcu_rows;
+  if (pt.nbands < 2)
+    goto out;
+
+  /* Collect pointers to all block rows of both coefficient buffers.  (The
+   * full-image virtual arrays are guaranteed to be in memory: the library
+   * is built without a backing store, so they could not have been realized
+   * otherwise.)
+   */
+  pt.rows = (JBLOCKROW *)calloc(nrows, sizeof(JBLOCKROW));
+  pt.rows_uq = (JBLOCKROW *)calloc(nrows, sizeof(JBLOCKROW));
+  if (pt.rows == NULL || pt.rows_uq == NULL)
+    goto out;
+  for (r = 0; r < nrows; r++) {
+    pt.rows[r] = (*cinfo->mem->access_virt_barray)
+      ((j_common_ptr)cinfo, whole_image[cindex], r, (JDIMENSION)1, TRUE)[0];
+    pt.rows_uq[r] = (*cinfo->mem->access_virt_barray)
+      ((j_common_ptr)cinfo, whole_image_uq[cindex], r, (JDIMENSION)1,
+       TRUE)[0];
+  }
+
+  if (pt.fold) {
+    for (b = 0; b < pt.nbands; b++) {
+      pt.band_dc_counts[b] = (long *)calloc(257, sizeof(long));
+      pt.band_ac_counts[b] = (long *)calloc(257, sizeof(long));
+      if (pt.band_dc_counts[b] == NULL || pt.band_ac_counts[b] == NULL)
+        goto out;
+    }
+  }
+
+  /* The derived tables are built once and shared read-only. */
+  jpeg_make_c_derived_tbl(cinfo, TRUE, compptr->dc_tbl_no, &dctbl);
+  jpeg_make_c_derived_tbl(cinfo, FALSE, compptr->ac_tbl_no, &actbl);
+  pt.dctbl = dctbl;
+  pt.actbl = actbl;
+
+  started = 0;
+  for (i = 0; i < pt.nbands; i++) {
+    if (pthread_create(&tids[i], NULL, par_trellis_worker, &pt) != 0)
+      break;
+    started++;
+  }
+  if (started == 0)
+    par_trellis_worker(&pt);    /* run the bands on this thread */
+  for (i = 0; i < started; i++)
+    pthread_join(tids[i], NULL);
+
+  if (pt.failed)
+    goto out;
+
+  if (pt.fold) {
+    long *dc_counts = cinfo->master->fold_dc_counts[compptr->dc_tbl_no];
+    long *ac_counts = cinfo->master->fold_ac_counts[compptr->ac_tbl_no];
+
+    /* Correct the deferred band-boundary DC differences: band b's first
+     * block was counted as a zero difference, but its predecessor is the
+     * last block of band b-1.
+     */
+    for (b = 1; b < pt.nbands; b++) {
+      if (pt.band_fixup[b]) {
+        int diff = pt.band_first_dc[b] - pt.band_last_dc[b - 1];
+        int nbits;
+
+        if (diff < 0)
+          diff = -diff;
+        nbits = JPEG_NBITS(diff);
+        pt.band_dc_counts[b][0]--;
+        pt.band_dc_counts[b][nbits]++;
+      }
+    }
+    for (b = 0; b < pt.nbands; b++) {
+      for (i = 0; i < 257; i++) {
+        dc_counts[i] += pt.band_dc_counts[b][i];
+        ac_counts[i] += pt.band_ac_counts[b][i];
+      }
+    }
+    cinfo->master->fold_last_dc[cindex] = pt.band_last_dc[pt.nbands - 1];
+  }
+
+  cinfo->master->par_backend_pass = master->pass_number;
+  ok = TRUE;
+
+out:
+  for (b = 0; b < PAR_MAX_THREADS; b++) {
+    free(pt.band_dc_counts[b]);
+    free(pt.band_ac_counts[b]);
+  }
+  free(pt.rows);
+  free(pt.rows_uq);
+  pthread_mutex_destroy(&pt.lock);
+  return ok;
+}
+
+/*
+ * Multithreaded statistics-gathering pass for one component.
+ *
+ * The statistics passes between the trellis passes only count symbols:
+ * the AC symbols of a block are independent of every other block, and the
+ * DC-difference symbols depend on the immediately preceding block of the
+ * (raster-order, single-component) scan, whose final coefficients are
+ * already in the coefficient buffer.  Each worker therefore counts a
+ * contiguous band of block rows into private arrays, reading the DC
+ * predictor entering its band directly from the buffer, and the sums are
+ * installed as the scan's statistics.  This is exact for sequential
+ * (Huffman) scans; progressive scans are not handled here because their
+ * EOB-run state spans blocks.
+ */
+
+typedef struct par_gather_state {
+  j_compress_ptr maincinfo;
+  jpeg_component_info *compptr;
+  JBLOCKROW *rows;              /* all block rows of the component */
+  JDIMENSION total_rows;        /* height_in_blocks */
+  int nbands;
+  long *band_dc_counts[PAR_MAX_THREADS];
+  long *band_ac_counts[PAR_MAX_THREADS];
+  int band_index;
+  pthread_mutex_t lock;
+  boolean failed;
+} par_gather_state;
+
+
+static void
+par_gather_band(par_gather_state *pg, int band)
+{
+  j_compress_ptr maininfo = pg->maincinfo;
+  struct jpeg_compress_struct wc;
+  par_error_mgr werr;
+  JDIMENSION r, r0, r1, col, width;
+  unsigned int restart = maininfo->restart_interval;
+  long *dc_counts = pg->band_dc_counts[band];
+  long *ac_counts = pg->band_ac_counts[band];
+  int last_dc = 0;
+
+  r0 = (JDIMENSION)((double)pg->total_rows * band / pg->nbands);
+  r1 = (JDIMENSION)((double)pg->total_rows * (band + 1) / pg->nbands);
+  width = pg->compptr->width_in_blocks;
+
+  memset(&wc, 0, sizeof(wc));
+  wc.err = jpeg_std_error(&werr.pub);
+  werr.pub.error_exit = par_error_exit;
+  werr.pub.output_message = par_output_message;
+
+  if (setjmp(werr.jb)) {
+    jpeg_destroy_compress(&wc);
+    pthread_mutex_lock(&pg->lock);
+    pg->failed = TRUE;
+    pthread_mutex_unlock(&pg->lock);
+    return;
+  }
+
+  jpeg_create_compress(&wc);
+  wc.data_precision = maininfo->data_precision;
+  wc.entropy = maininfo->entropy;       /* read only (simd_gather flag) */
+
+  /* DC predictor entering the band: the preceding block of the raster
+   * scan, unless the band starts at a restart boundary (which the
+   * per-block check below handles.)
+   */
+  if (r0 > 0)
+    last_dc = pg->rows[r0 - 1][width - 1][0];
+
+  for (r = r0; r < r1; r++) {
+    JBLOCKROW row = pg->rows[r];
+
+    for (col = 0; col < width; col++) {
+      if (restart && (r * width + col) % restart == 0)
+        last_dc = 0;            /* DC prediction restarts with this block */
+      jpeg_fold_count_block(&wc, row[col], last_dc, dc_counts, ac_counts);
+      last_dc = row[col][0];
+    }
+  }
+
+  jpeg_destroy_compress(&wc);
+}
+
+
+static void *
+par_gather_worker(void *arg)
+{
+  par_gather_state *pg = (par_gather_state *)arg;
+
+  for (;;) {
+    int band;
+
+    pthread_mutex_lock(&pg->lock);
+    band = pg->band_index < pg->nbands ? pg->band_index++ : -1;
+    pthread_mutex_unlock(&pg->lock);
+    if (band < 0)
+      return NULL;
+    par_gather_band(pg, band);
+  }
+}
+
+
+/*
+ * Gather the current single-component scan's statistics on worker threads
+ * and install them as the entropy encoder's counts.  Called from
+ * prepare_for_pass() after the entropy encoder has been started in
+ * statistics-gathering mode.  Returns TRUE if the counts were installed
+ * (the caller then lets the pass run as a no-op); FALSE leaves the
+ * sequential pass to do the gathering.
+ */
+
+GLOBAL(boolean)
+jpeg_par_gather_pass(j_compress_ptr cinfo)
+{
+  jvirt_barray_ptr *whole_image;
+  jpeg_component_info *compptr;
+  par_gather_state pg;
+  pthread_t tids[PAR_MAX_THREADS];
+  JDIMENSION r;
+  long dc_counts[257], ac_counts[257];
+  int cindex, nthreads, started, i, b;
+  boolean ok = FALSE;
+
+  if (cinfo->arith_code || cinfo->progressive_mode ||
+      cinfo->master->lossless || cinfo->comps_in_scan != 1)
+    return FALSE;
+
+  nthreads = (int)par_env_number("MOZJPEG_SCAN_THREADS",
+                                 sysconf(_SC_NPROCESSORS_ONLN));
+  if (nthreads > PAR_MAX_THREADS)
+    nthreads = PAR_MAX_THREADS;
+  if (nthreads < 2)
+    return FALSE;
+
+  whole_image = jpeg_par_coef_arrays(cinfo);
+  if (whole_image == NULL)
+    return FALSE;
+
+  compptr = cinfo->cur_comp_info[0];
+  cindex = compptr->component_index;
+
+  memset(&pg, 0, sizeof(pg));
+  pg.maincinfo = cinfo;
+  pg.compptr = compptr;
+  pg.total_rows = compptr->height_in_blocks;
+  if (pthread_mutex_init(&pg.lock, NULL) != 0)
+    return FALSE;
+
+  pg.nbands = nthreads;
+  if ((JDIMENSION)pg.nbands > pg.total_rows)
+    pg.nbands = (int)pg.total_rows;
+  if (pg.nbands < 2)
+    goto out;
+
+  pg.rows = (JBLOCKROW *)calloc(pg.total_rows, sizeof(JBLOCKROW));
+  if (pg.rows == NULL)
+    goto out;
+  for (r = 0; r < pg.total_rows; r++)
+    pg.rows[r] = (*cinfo->mem->access_virt_barray)
+      ((j_common_ptr)cinfo, whole_image[cindex], r, (JDIMENSION)1, FALSE)[0];
+
+  for (b = 0; b < pg.nbands; b++) {
+    pg.band_dc_counts[b] = (long *)calloc(257, sizeof(long));
+    pg.band_ac_counts[b] = (long *)calloc(257, sizeof(long));
+    if (pg.band_dc_counts[b] == NULL || pg.band_ac_counts[b] == NULL)
+      goto out;
+  }
+
+  started = 0;
+  for (i = 0; i < pg.nbands; i++) {
+    if (pthread_create(&tids[i], NULL, par_gather_worker, &pg) != 0)
+      break;
+    started++;
+  }
+  if (started == 0)
+    par_gather_worker(&pg);     /* run the bands on this thread */
+  for (i = 0; i < started; i++)
+    pthread_join(tids[i], NULL);
+
+  if (pg.failed)
+    goto out;
+
+  memset(dc_counts, 0, sizeof(dc_counts));
+  memset(ac_counts, 0, sizeof(ac_counts));
+  for (b = 0; b < pg.nbands; b++) {
+    for (i = 0; i < 257; i++) {
+      dc_counts[i] += pg.band_dc_counts[b][i];
+      ac_counts[i] += pg.band_ac_counts[b][i];
+    }
+  }
+  jpeg_gather_set_counts(cinfo, dc_counts, ac_counts);
+  ok = TRUE;
+
+out:
+  for (b = 0; b < PAR_MAX_THREADS; b++) {
+    free(pg.band_dc_counts[b]);
+    free(pg.band_ac_counts[b]);
+  }
+  free(pg.rows);
+  pthread_mutex_destroy(&pg.lock);
+  return ok;
+}
+
+/*
+ * Multithreaded data-output pass for sequential Huffman scans.
+ *
+ * Each worker encodes a contiguous band of MCUs into a private memory
+ * buffer with a private entropy encoder, and the band streams are stitched
+ * into the real destination afterwards:
+ *
+ * - Without restart markers, the bands cover whole MCU rows.  A band's DC
+ *   predictors are seeded from the last MCU preceding it (the coefficients
+ *   are final, so the values can be read from the coefficient buffer), and
+ *   the band's trailing 0..7 bits are carried into the next band by the
+ *   stitcher, which shifts the following band's bytes accordingly
+ *   (removing and re-inserting the 0xFF byte stuffing.)  The final partial
+ *   byte is padded with ones exactly as flush_bits() would.
+ *
+ * - With restart markers, the bands cover whole restart intervals, so
+ *   every band starts with fresh encoder state and ends byte-aligned (the
+ *   padding before a restart marker equals the end-of-band padding.)  The
+ *   stitcher emits the boundary restart markers itself and renumbers the
+ *   markers inside each band buffer (the workers number them from zero.)
+ *
+ * In both cases the stitched scan body is bit-for-bit identical to the
+ * sequential encoder's.  Progressive and arithmetic scans are left to the
+ * sequential machinery.
+ */
+
+typedef struct par_emit_state {
+  j_compress_ptr maincinfo;
+  JBLOCKROW *rows[MAX_COMPS_IN_SCAN]; /* block rows per scan component */
+  JDIMENSION mcus_per_row;
+  JDIMENSION total_mcus;
+  unsigned int restart;         /* restart interval in MCUs (0 = none) */
+  int nbands;
+  JDIMENSION first[PAR_MAX_THREADS + 1]; /* band b = [first[b], first[b+1]) */
+  unsigned char *buf[PAR_MAX_THREADS];
+  unsigned long size[PAR_MAX_THREADS];
+  unsigned int partial[PAR_MAX_THREADS];  /* trailing bits of the band */
+  int partial_bits[PAR_MAX_THREADS];
+  int band_index;
+  pthread_mutex_t lock;
+  boolean failed;
+} par_emit_state;
+
+
+static void
+par_emit_band(par_emit_state *pe, int band)
+{
+  j_compress_ptr maininfo = pe->maincinfo;
+  struct jpeg_compress_struct wc;
+  par_error_mgr werr;
+  unsigned char *buf = NULL;
+  unsigned long bufsize = 0;
+  JBLOCKROW mcu_buffer[C_MAX_BLOCKS_IN_MCU];
+  JDIMENSION m, m0 = pe->first[band], m1 = pe->first[band + 1];
+  int ci, i;
+
+  memset(&wc, 0, sizeof(wc));
+  wc.err = jpeg_std_error(&werr.pub);
+  werr.pub.error_exit = par_error_exit;
+  werr.pub.output_message = par_output_message;
+
+  if (setjmp(werr.jb)) {
+    jpeg_destroy_compress(&wc);
+    free(buf);
+    pthread_mutex_lock(&pe->lock);
+    pe->failed = TRUE;
+    pthread_mutex_unlock(&pe->lock);
+    return;
+  }
+
+  jpeg_create_compress(&wc);
+
+  wc.image_width = maininfo->image_width;
+  wc.image_height = maininfo->image_height;
+  wc.data_precision = maininfo->data_precision;
+  wc.num_components = maininfo->num_components;
+  wc.jpeg_color_space = maininfo->jpeg_color_space;
+  wc.max_h_samp_factor = maininfo->max_h_samp_factor;
+  wc.max_v_samp_factor = maininfo->max_v_samp_factor;
+  wc.total_iMCU_rows = maininfo->total_iMCU_rows;
+  wc.progressive_mode = FALSE;
+  wc.optimize_coding = FALSE;   /* encode with the tables as given */
+  wc.arith_code = FALSE;
+  wc.restart_interval = pe->restart;
+  wc.restart_in_rows = 0;
+
+  wc.comp_info = (jpeg_component_info *)
+    (*wc.mem->alloc_small) ((j_common_ptr)&wc, JPOOL_IMAGE,
+                            wc.num_components * sizeof(jpeg_component_info));
+  memcpy(wc.comp_info, maininfo->comp_info,
+         wc.num_components * sizeof(jpeg_component_info));
+
+  for (i = 0; i < NUM_HUFF_TBLS; i++) {
+    if (maininfo->dc_huff_tbl_ptrs[i] != NULL) {
+      wc.dc_huff_tbl_ptrs[i] = jpeg_alloc_huff_table((j_common_ptr)&wc);
+      memcpy(wc.dc_huff_tbl_ptrs[i], maininfo->dc_huff_tbl_ptrs[i],
+             sizeof(JHUFF_TBL));
+    }
+    if (maininfo->ac_huff_tbl_ptrs[i] != NULL) {
+      wc.ac_huff_tbl_ptrs[i] = jpeg_alloc_huff_table((j_common_ptr)&wc);
+      memcpy(wc.ac_huff_tbl_ptrs[i], maininfo->ac_huff_tbl_ptrs[i],
+             sizeof(JHUFF_TBL));
+    }
+  }
+
+  jinit_huff_encoder(&wc);
+  jpeg_mem_dest_internal(&wc, &buf, &bufsize, JPOOL_IMAGE);
+
+  wc.comps_in_scan = maininfo->comps_in_scan;
+  for (ci = 0; ci < maininfo->comps_in_scan; ci++)
+    wc.cur_comp_info[ci] =
+      &wc.comp_info[maininfo->cur_comp_info[ci]->component_index];
+  wc.Ss = maininfo->Ss;
+  wc.Se = maininfo->Se;
+  wc.Ah = maininfo->Ah;
+  wc.Al = maininfo->Al;
+  jpeg_par_per_scan_setup(&wc);
+
+  (*wc.dest->init_destination) (&wc);
+  (*wc.entropy->start_pass) (&wc, FALSE);
+
+  /* Seed the DC predictors from the last MCU preceding the band.  (With
+   * restart markers, bands start at restart boundaries, where the
+   * predictors are zero -- the encoder's fresh state.)
+   */
+  if (m0 > 0 && pe->restart == 0) {
+    int seeds[MAX_COMPS_IN_SCAN];
+    JDIMENSION prow = (m0 - 1) / pe->mcus_per_row;
+    JDIMENSION pcol = (m0 - 1) % pe->mcus_per_row;
+
+    for (ci = 0; ci < wc.comps_in_scan; ci++) {
+      jpeg_component_info *compptr = wc.cur_comp_info[ci];
+
+      seeds[ci] = pe->rows[ci][prow * compptr->MCU_height +
+                               compptr->MCU_height - 1]
+                          [pcol * compptr->MCU_width +
+                           compptr->MCU_width - 1][0];
+    }
+    jpeg_huff_seed_dc(&wc, seeds);
+  }
+
+  for (m = m0; m < m1; m++) {
+    JDIMENSION mrow = m / pe->mcus_per_row;
+    JDIMENSION mcol = m % pe->mcus_per_row;
+    int blkn = 0, x;
+
+    for (ci = 0; ci < wc.comps_in_scan; ci++) {
+      jpeg_component_info *compptr = wc.cur_comp_info[ci];
+      JDIMENSION start_col = mcol * compptr->MCU_width;
+
+      for (i = 0; i < compptr->MCU_height; i++) {
+        JBLOCKROW row = pe->rows[ci][mrow * compptr->MCU_height + i] +
+                        start_col;
+
+        for (x = 0; x < compptr->MCU_width; x++)
+          mcu_buffer[blkn++] = row + x;
+      }
+    }
+    if (!(*wc.entropy->encode_mcu) (&wc, mcu_buffer))
+      ERREXIT(&wc, JERR_CANT_SUSPEND);  /* memory dest cannot suspend */
+  }
+
+  if (pe->restart) {
+    /* Pad to a byte boundary, as the sequential encoder does before a
+     * restart marker (and at the end of the scan.)
+     */
+    (*wc.entropy->finish_pass) (&wc);
+    pe->partial_bits[band] = 0;
+    pe->partial[band] = 0;
+  } else {
+    pe->partial_bits[band] = jpeg_huff_flush_partial(&wc,
+                                                     &pe->partial[band]);
+  }
+  (*wc.dest->term_destination) (&wc);
+  jpeg_destroy_compress(&wc);
+
+  pe->buf[band] = buf;
+  pe->size[band] = bufsize;
+}
+
+
+static void *
+par_emit_worker(void *arg)
+{
+  par_emit_state *pe = (par_emit_state *)arg;
+
+  for (;;) {
+    int band;
+
+    pthread_mutex_lock(&pe->lock);
+    band = pe->band_index < pe->nbands ? pe->band_index++ : -1;
+    pthread_mutex_unlock(&pe->lock);
+    if (band < 0)
+      return NULL;
+    par_emit_band(pe, band);
+  }
+}
+
+
+/* Write bytes to the real destination. */
+
+static void
+par_emit_write(j_compress_ptr cinfo, const unsigned char *p, unsigned long n)
+{
+  struct jpeg_destination_mgr *dest = cinfo->dest;
+
+  while (n > 0) {
+    size_t chunk = n < dest->free_in_buffer ? (size_t)n :
+                   dest->free_in_buffer;
+
+    memcpy(dest->next_output_byte, p, chunk);
+    dest->next_output_byte += chunk;
+    dest->free_in_buffer -= chunk;
+    p += chunk;
+    n -= (unsigned long)chunk;
+    if (dest->free_in_buffer == 0 &&
+        !(*dest->empty_output_buffer) (cinfo))
+      ERREXIT(cinfo, JERR_CANT_SUSPEND);
+  }
+}
+
+
+/* Write one byte to the real destination, stuffing a zero after 0xFF. */
+
+static void
+par_emit_byte_stuffed(j_compress_ptr cinfo, int val)
+{
+  unsigned char b[2];
+
+  b[0] = (unsigned char)val;
+  b[1] = 0;
+  par_emit_write(cinfo, b, (val == 0xFF) ? 2 : 1);
+}
+
+
+/*
+ * Encode the current sequential Huffman scan's data on worker threads and
+ * write the stitched scan body to the destination.  Called from
+ * prepare_for_pass() after the scan header has been written.  Returns
+ * TRUE if the scan body was written (the caller then lets the pass run as
+ * a no-op); FALSE leaves the sequential pass to do the encoding (nothing
+ * has been written to the destination in that case.)
+ */
+
+GLOBAL(boolean)
+jpeg_par_emit_pass(j_compress_ptr cinfo)
+{
+  jvirt_barray_ptr *whole_image;
+  par_emit_state pe;
+  pthread_t tids[PAR_MAX_THREADS];
+  JDIMENSION mcu_rows, r, nrows;
+  unsigned int acc = 0;
+  int acc_bits = 0;
+  int nthreads, started, i, b, ci;
+  boolean ok = FALSE;
+
+  if (cinfo->arith_code || cinfo->progressive_mode ||
+      cinfo->master->lossless || cinfo->comps_in_scan < 1)
+    return FALSE;
+
+  nthreads = (int)par_env_number("MOZJPEG_SCAN_THREADS",
+                                 sysconf(_SC_NPROCESSORS_ONLN));
+  if (nthreads > PAR_MAX_THREADS)
+    nthreads = PAR_MAX_THREADS;
+  if (nthreads < 2)
+    return FALSE;
+
+  whole_image = jpeg_par_coef_arrays(cinfo);
+  if (whole_image == NULL)
+    return FALSE;
+
+  memset(&pe, 0, sizeof(pe));
+  pe.maincinfo = cinfo;
+  pe.mcus_per_row = cinfo->MCUs_per_row;
+  mcu_rows = (cinfo->comps_in_scan > 1) ? cinfo->total_iMCU_rows :
+             cinfo->cur_comp_info[0]->height_in_blocks;
+  pe.total_mcus = pe.mcus_per_row * mcu_rows;
+  pe.restart = cinfo->restart_interval;
+  if (pthread_mutex_init(&pe.lock, NULL) != 0)
+    return FALSE;
+
+  /* Partition the MCUs into bands: whole restart intervals when restart
+   * markers are in use (so that every band starts with fresh encoder
+   * state and ends byte-aligned), whole MCU rows otherwise.
+   */
+  if (pe.restart) {
+    JDIMENSION intervals = (pe.total_mcus + pe.restart - 1) / pe.restart;
+
+    pe.nbands = nthreads;
+    if ((JDIMENSION)pe.nbands > intervals)
+      pe.nbands = (int)intervals;
+    if (pe.nbands < 2)
+      goto out;
+    for (b = 0; b < pe.nbands; b++)
+      pe.first[b] = (JDIMENSION)((double)intervals * b / pe.nbands) *
+                    pe.restart;
+  } else {
+    pe.nbands = nthreads;
+    if ((JDIMENSION)pe.nbands > mcu_rows)
+      pe.nbands = (int)mcu_rows;
+    if (pe.nbands < 2)
+      goto out;
+    for (b = 0; b < pe.nbands; b++)
+      pe.first[b] = (JDIMENSION)((double)mcu_rows * b / pe.nbands) *
+                    pe.mcus_per_row;
+  }
+  pe.first[pe.nbands] = pe.total_mcus;
+
+  /* Collect pointers to the block rows of the scan's components. */
+  for (ci = 0; ci < cinfo->comps_in_scan; ci++) {
+    jpeg_component_info *compptr = cinfo->cur_comp_info[ci];
+
+    nrows = mcu_rows * (JDIMENSION)compptr->MCU_height;
+    pe.rows[ci] = (JBLOCKROW *)calloc(nrows, sizeof(JBLOCKROW));
+    if (pe.rows[ci] == NULL)
+      goto out;
+    for (r = 0; r < nrows; r++)
+      pe.rows[ci][r] = (*cinfo->mem->access_virt_barray)
+        ((j_common_ptr)cinfo, whole_image[compptr->component_index], r,
+         (JDIMENSION)1, FALSE)[0];
+  }
+
+  started = 0;
+  for (i = 0; i < pe.nbands; i++) {
+    if (pthread_create(&tids[i], NULL, par_emit_worker, &pe) != 0)
+      break;
+    started++;
+  }
+  if (started == 0)
+    par_emit_worker(&pe);       /* run the bands on this thread */
+  for (i = 0; i < started; i++)
+    pthread_join(tids[i], NULL);
+
+  if (pe.failed)
+    goto out;
+
+  /* Stitch the band streams into the destination. */
+  if (pe.restart) {
+    for (b = 0; b < pe.nbands; b++) {
+      JDIMENSION base = pe.first[b] / pe.restart;
+      unsigned long n = pe.size[b], j;
+      unsigned char *p = pe.buf[b];
+
+      if (b > 0) {
+        /* Boundary restart marker (the one preceding this band's first
+         * MCU); restart k (before MCU (k+1)*restart) is numbered k mod 8.
+         * Marker bytes are not subject to zero stuffing.
+         */
+        unsigned char marker[2];
+
+        marker[0] = 0xFF;
+        marker[1] = (unsigned char)(0xD0 + ((base - 1) & 7));
+        par_emit_write(cinfo, marker, 2);
+      }
+      /* Renumber the restart markers inside the band: the worker numbered
+       * them from zero, but the j-th one is restart number base + j.
+       */
+      for (j = 0; j + 1 < n; j++) {
+        if (p[j] == 0xFF && p[j + 1] >= 0xD0 && p[j + 1] <= 0xD7) {
+          p[j + 1] = (unsigned char)(0xD0 +
+                                     (((p[j + 1] - 0xD0) + base) & 7));
+          j++;
+        } else if (p[j] == 0xFF) {
+          j++;                  /* skip the stuffed zero */
+        }
+      }
+      par_emit_write(cinfo, p, n);
+    }
+  } else {
+    for (b = 0; b < pe.nbands; b++) {
+      unsigned long n = pe.size[b], j;
+      unsigned char *p = pe.buf[b];
+
+      if (acc_bits == 0) {
+        /* Byte-aligned: the band's bytes (and their stuffing) are valid
+         * as they are.
+         */
+        par_emit_write(cinfo, p, n);
+      } else {
+        /* Shift the band by the pending bits, dropping its stuffing and
+         * re-stuffing the shifted stream.
+         */
+        for (j = 0; j < n; j++) {
+          if (p[j] == 0 && j > 0 && p[j - 1] == 0xFF)
+            continue;           /* stuffed zero */
+          acc = (acc << 8) | p[j];
+          par_emit_byte_stuffed(cinfo, (int)((acc >> acc_bits) & 0xFF));
+        }
+      }
+      if (pe.partial_bits[b]) {
+        acc = (acc << pe.partial_bits[b]) | pe.partial[b];
+        acc_bits += pe.partial_bits[b];
+        if (acc_bits >= 8) {
+          acc_bits -= 8;
+          par_emit_byte_stuffed(cinfo, (int)((acc >> acc_bits) & 0xFF));
+        }
+      }
+    }
+    if (acc_bits > 0) {
+      /* Pad the final partial byte with ones, as flush_bits() would. */
+      par_emit_byte_stuffed(cinfo, (int)(((acc << (8 - acc_bits)) |
+                                          (0xFF >> acc_bits)) & 0xFF));
+    }
+  }
+  ok = TRUE;
+
+out:
+  for (b = 0; b < PAR_MAX_THREADS; b++)
+    free(pe.buf[b]);
+  for (ci = 0; ci < MAX_COMPS_IN_SCAN; ci++)
+    free(pe.rows[ci]);
+  pthread_mutex_destroy(&pe.lock);
+  return ok;
+}
+
+#else /* BITS_IN_JSAMPLE != 8 */
+
+GLOBAL(boolean)
+jpeg_par_trellis_pass(j_compress_ptr cinfo, JDIMENSION iMCU_row_num)
+{
+  (void)cinfo;
+  (void)iMCU_row_num;
+  return FALSE;
+}
+
+GLOBAL(boolean)
+jpeg_par_gather_pass(j_compress_ptr cinfo)
+{
+  (void)cinfo;
+  return FALSE;
+}
+
+GLOBAL(boolean)
+jpeg_par_emit_pass(j_compress_ptr cinfo)
+{
+  (void)cinfo;
+  return FALSE;
+}
+
+#endif /* BITS_IN_JSAMPLE == 8 */
 
 #endif /* WITH_SCAN_OPT_THREADS */

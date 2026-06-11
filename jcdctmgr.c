@@ -27,6 +27,19 @@
 #include <assert.h>
 #include <math.h>
 
+/* Use a vectorized implementation of the run-start search in the trellis
+ * quantizer on AArch64 (where Neon is part of the baseline ISA.)  NOTE: the
+ * vectorized search evaluates the same candidate set as the scalar search,
+ * but it accumulates the floating-point cost terms in a different order and
+ * resolves cost ties differently, so it can quantize an occasional
+ * coefficient differently.  The compressed output therefore differs
+ * (negligibly) from that of the scalar implementation.
+ */
+#if defined(WITH_SIMD) && (defined(__aarch64__) || defined(_M_ARM64))
+#define TRELLIS_NEON  1
+#include <arm_neon.h>
+#endif
+
 
 /* Private subobject for this module */
 
@@ -948,6 +961,13 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
   int half_q[DCTSIZE2];
   int ac_zero_thresh[DCTSIZE2];
   int zero_block_check;
+#ifdef TRELLIS_NEON
+  int16_t nz_pos16[DCTSIZE2];   /* nz_idx, as int16 */
+  float nz_base[DCTSIZE2];      /* accumulated_cost - accumulated_zero_dist
+                                   at the nz_idx positions */
+  uint8x16_t ehufsi_slices[11]; /* ehufsi[16*r + b] for r = 0..15, b = 1..10 */
+  int zrl_len;
+#endif
   int bi;
   float best_cost;
   int last_coeff_idx; /* position of last nonzero coefficient */
@@ -1039,6 +1059,22 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
   zero_block_check = (Ss == 1 && Se == DCTSIZE2 - 1 &&
                       !cinfo->master->trellis_eob_opt &&
                       !cinfo->master->trellis_q_opt);
+
+#ifdef TRELLIS_NEON
+  /* For each possible number of coefficient magnitude bits b, gather the
+   * code lengths of the 16 run/size symbols (r << 4) + b into one 16-byte
+   * table, so that the vectorized run-start search can look code lengths up
+   * for 8 candidate run starts with a single TBL instruction.
+   */
+  for (k = 1; k <= 10; k++) {
+    uint8_t slice[16];
+
+    for (i = 0; i < 16; i++)
+      slice[i] = (uint8_t)actbl->ehufsi[16 * i + k];
+    ehufsi_slices[k] = vld1q_u8(slice);
+  }
+  zrl_len = actbl->ehufsi[0xf0];
+#endif
 
   norm = 0.0;
   for (i = 1; i < DCTSIZE2; i++) {
@@ -1213,16 +1249,95 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
       {
         /* Only positions with a nonzero quantized coefficient (and the
          * starting position Ss-1) can end a zero run, so it suffices to
-         * iterate over those.  This computes exactly the same costs in
-         * exactly the same order as iterating j over [Ss-1, i) and skipping
-         * positions that hold a zero coefficient.
+         * iterate over those.
          */
         float azd_im1 = accumulated_zero_dist[i-1];
         float best_cost_i = 1e38;
         int best_qval = 0, best_j = 0, improved = 0;
+#ifdef TRELLIS_NEON
+        int vec_full = 0;
+
+        if (num_nz >= 8) {
+          /* Evaluate the candidate run starts 8 at a time.  The code length
+           * of the run/size symbol is looked up with TBL from the per-size
+           * slice tables; lanes without a usable code are forced to a huge
+           * cost.  The start state (j = Ss-1) and the partial tail are
+           * handled by the scalar loop below.
+           */
+          int cb_base;
+          uint16x8_t skipfix = vdupq_n_u16(zrl_len == 0 ? 0xFFFF : 0);
+          int16x8_t im1 = vdupq_n_s16((int16_t)(i - 1));
+          float32x4_t azdv = vdupq_n_f32(azd_im1);
+          float32x4_t big = vdupq_n_f32(1e38f);
+
+          vec_full = num_nz & ~7;
+
+          for (cb_base = 0; cb_base < vec_full; cb_base += 8) {
+            int16x8_t jv = vld1q_s16(nz_pos16 + cb_base);
+            uint16x8_t zr = vreinterpretq_u16_s16(vsubq_s16(im1, jv));
+            uint16x8_t zrh = vshrq_n_u16(zr, 4);
+            uint16x8_t runbits = vmulq_n_u16(zrh, (uint16_t)zrl_len);
+            uint8x8_t zr15 = vmovn_u16(vandq_u16(zr, vdupq_n_u16(15)));
+            /* lanes with zero_run >= 16 are unusable if there is no ZRL
+             * code */
+            uint16x8_t skip = vandq_u16(vtstq_u16(zrh, zrh), skipfix);
+            float32x4_t base_lo = vaddq_f32(vld1q_f32(nz_base + cb_base),
+                                            azdv);
+            float32x4_t base_hi = vaddq_f32(vld1q_f32(nz_base + cb_base + 4),
+                                            azdv);
+
+            for (k = 0; k < num_candidates; k++) {
+              uint8x8_t cb8 = vqtbl1_u8(ehufsi_slices[k + 1], zr15);
+              uint16x8_t cb16 = vmovl_u8(cb8);
+              uint16x8_t invalid = vorrq_u16(vceqq_u16(cb16,
+                                                       vdupq_n_u16(0)),
+                                             skip);
+              uint16x8_t ratei = vaddq_u16(vaddq_u16(cb16, runbits),
+                                           vdupq_n_u16((uint16_t)(k + 1)));
+              uint32x4_t inv_lo = vmovl_u16(vget_low_u16(invalid));
+              uint32x4_t inv_hi = vmovl_u16(vget_high_u16(invalid));
+              float32x4_t dk = vdupq_n_f32(candidate_dist[k]);
+              float32x4_t cost_lo =
+                vcvtq_f32_u32(vmovl_u16(vget_low_u16(ratei)));
+              float32x4_t cost_hi =
+                vcvtq_f32_u32(vmovl_u16(vget_high_u16(ratei)));
+              float m;
+
+              cost_lo = vaddq_f32(vaddq_f32(cost_lo, dk), base_lo);
+              cost_hi = vaddq_f32(vaddq_f32(cost_hi, dk), base_hi);
+              cost_lo = vbslq_f32(vtstq_u32(inv_lo, inv_lo), big, cost_lo);
+              cost_hi = vbslq_f32(vtstq_u32(inv_hi, inv_hi), big, cost_hi);
+
+              m = vminvq_f32(vminq_f32(cost_lo, cost_hi));
+              if (m < best_cost_i) {
+                float lane_costs[8];
+                int lane;
+
+                vst1q_f32(lane_costs, cost_lo);
+                vst1q_f32(lane_costs + 4, cost_hi);
+                for (lane = 0; lane < 7; lane++)
+                  if (lane_costs[lane] == m)
+                    break;
+                best_cost_i = m;
+                best_qval = candidate[k];
+                best_j = nz_pos16[cb_base + lane];
+                improved = 1;
+              }
+            }
+          }
+        }
+#endif
 
         for (jj = -1; jj < num_nz; jj++) {
           float acost_j, azd_j;
+
+#ifdef TRELLIS_NEON
+          if (jj == 0 && vec_full) {
+            jj = vec_full;      /* covered by the vectorized search */
+            if (jj >= num_nz)
+              break;
+          }
+#endif
 
           j = (jj < 0) ? Ss - 1 : nz_idx[jj];
 
@@ -1261,8 +1376,13 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
         }
       }
 
-      if (coef_blocks[bi][z] != 0)
+      if (coef_blocks[bi][z] != 0) {
+#ifdef TRELLIS_NEON
+        nz_pos16[num_nz] = (int16_t)i;
+        nz_base[num_nz] = accumulated_cost[i] - accumulated_zero_dist[i];
+#endif
         nz_idx[num_nz++] = i;
+      }
     }
     
     last_coeff_idx = Ss-1;

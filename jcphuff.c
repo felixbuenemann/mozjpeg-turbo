@@ -460,6 +460,136 @@ flush_bits(phuff_entropy_ptr entropy)
 }
 
 
+/* The tightest loops (currently only the AC initial-scan encoding loop) keep
+ * the bit buffer and the output pointer in local variables and use the same
+ * macros as the baseline Huffman encoder in jchuff.c, writing into a local
+ * buffer that is guaranteed to be large enough for one MCU's worth of data.
+ */
+
+/* Output byte b and, speculatively, an additional 0 byte.  0xFF must be
+ * encoded as 0xFF 0x00, so the output buffer pointer is advanced by 2 if the
+ * byte is 0xFF.  Otherwise, the output buffer pointer is advanced by 1, and
+ * the speculative 0 byte will be overwritten by the next byte.
+ */
+#define EMIT_BYTE(b) { \
+  buffer[0] = (JOCTET)(b); \
+  buffer[1] = 0; \
+  buffer -= -2 + ((JOCTET)(b) < 0xFF); \
+}
+
+/* Output the entire bit buffer.  If there are no 0xFF bytes in it, then write
+ * directly to the output buffer.  Otherwise, use the EMIT_BYTE() macro to
+ * encode 0xFF as 0xFF 0x00.
+ */
+#if BIT_BUF_SIZE == 64
+
+#define FLUSH() { \
+  if (put_buffer & 0x8080808080808080 & ~(put_buffer + 0x0101010101010101)) { \
+    EMIT_BYTE(put_buffer >> 56) \
+    EMIT_BYTE(put_buffer >> 48) \
+    EMIT_BYTE(put_buffer >> 40) \
+    EMIT_BYTE(put_buffer >> 32) \
+    EMIT_BYTE(put_buffer >> 24) \
+    EMIT_BYTE(put_buffer >> 16) \
+    EMIT_BYTE(put_buffer >>  8) \
+    EMIT_BYTE(put_buffer      ) \
+  } else { \
+    buffer[0] = (JOCTET)(put_buffer >> 56); \
+    buffer[1] = (JOCTET)(put_buffer >> 48); \
+    buffer[2] = (JOCTET)(put_buffer >> 40); \
+    buffer[3] = (JOCTET)(put_buffer >> 32); \
+    buffer[4] = (JOCTET)(put_buffer >> 24); \
+    buffer[5] = (JOCTET)(put_buffer >> 16); \
+    buffer[6] = (JOCTET)(put_buffer >> 8); \
+    buffer[7] = (JOCTET)(put_buffer); \
+    buffer += 8; \
+  } \
+}
+
+#else
+
+#define FLUSH() { \
+  if (put_buffer & 0x80808080 & ~(put_buffer + 0x01010101)) { \
+    EMIT_BYTE(put_buffer >> 24) \
+    EMIT_BYTE(put_buffer >> 16) \
+    EMIT_BYTE(put_buffer >>  8) \
+    EMIT_BYTE(put_buffer      ) \
+  } else { \
+    buffer[0] = (JOCTET)(put_buffer >> 24); \
+    buffer[1] = (JOCTET)(put_buffer >> 16); \
+    buffer[2] = (JOCTET)(put_buffer >> 8); \
+    buffer[3] = (JOCTET)(put_buffer); \
+    buffer += 4; \
+  } \
+}
+
+#endif
+
+/* Fill the bit buffer to capacity with the leading bits from code, then output
+ * the bit buffer and put the remaining bits from code into the bit buffer.
+ */
+#define PUT_AND_FLUSH(code, size) { \
+  put_buffer = (put_buffer << (size + free_bits)) | (code >> -free_bits); \
+  FLUSH() \
+  free_bits += BIT_BUF_SIZE; \
+  put_buffer = code; \
+}
+
+/* Insert code into the bit buffer and output the bit buffer if needed.
+ * NOTE: We can't flush with free_bits == 0, since the left shift in
+ * PUT_AND_FLUSH() would have undefined behavior.
+ */
+#define PUT_BITS(code, size) { \
+  free_bits -= size; \
+  if (free_bits < 0) \
+    PUT_AND_FLUSH(code, size) \
+  else \
+    put_buffer = (put_buffer << size) | code; \
+}
+
+/* Although it is exceedingly rare, it is possible for an encoded MCU (one
+ * block in an AC scan) to be larger than the 128-byte unencoded block.  Up to
+ * 63 coefficients are coded with at most 16 + 14 bits each, so an encoded
+ * block cannot be larger than 30 * 63 / 8 bytes plus byte stuffing plus the
+ * granularity of bit-buffer flushes.
+ */
+#define BUFSIZE  (DCTSIZE2 * 8)
+
+#define LOAD_BUFFER() { \
+  if (entropy->free_in_buffer < BUFSIZE) { \
+    localbuf = 1; \
+    buffer = _buffer; \
+  } else \
+    buffer = entropy->next_output_byte; \
+}
+
+#define STORE_BUFFER() { \
+  if (localbuf) { \
+    size_t bytes, bytestocopy; \
+    bytes = buffer - _buffer; \
+    buffer = _buffer; \
+    while (bytes > 0) { \
+      bytestocopy = MIN(bytes, entropy->free_in_buffer); \
+      memcpy(entropy->next_output_byte, buffer, bytestocopy); \
+      entropy->next_output_byte += bytestocopy; \
+      buffer += bytestocopy; \
+      entropy->free_in_buffer -= bytestocopy; \
+      if (entropy->free_in_buffer == 0) \
+        dump_buffer(entropy); \
+      bytes -= bytestocopy; \
+    } \
+  } else { \
+    entropy->free_in_buffer -= (buffer - entropy->next_output_byte); \
+    entropy->next_output_byte = buffer; \
+    /* The emit_byte() macro requires at least one free byte in the output \
+     * buffer, so empty the buffer now if it is full. \
+     */ \
+    if (entropy->free_in_buffer == 0) \
+      dump_buffer(entropy); \
+  } \
+}
+
+
 /*
  * Emit (or just count) a Huffman symbol.
  */
@@ -754,7 +884,12 @@ encode_mcu_AC_first_prepare(const JCOEF *block,
  * or first pass of successive approximation).
  */
 
-#define ENCODE_COEFS_AC_FIRST(label) { \
+/* The body of the per-coefficient encoding loop, parameterized on the
+ * operations performed for a run-length-16 (ZRL) code and for a coefficient
+ * code, so that the statistics-gathering and the data-output passes can each
+ * use a specialized loop.
+ */
+#define ENCODE_COEFS_AC_FIRST(label, zrl_op, code_op) { \
   while (zerobits) { \
     r = count_zeroes(&zerobits); \
     cvalue += r; \
@@ -764,7 +899,7 @@ label \
     \
     /* if run length > 15, must emit special run-length-16 codes (0xF0) */ \
     while (r > 15) { \
-      emit_symbol(entropy, entropy->ac_tbl_no, 0xF0); \
+      zrl_op \
       r -= 16; \
     } \
     \
@@ -778,12 +913,41 @@ label \
      * that number of bits of the value, if positive, or the complement of \
      * its magnitude, if negative. \
      */ \
-    emit_symbol_and_bits(entropy, entropy->ac_tbl_no, (r << 4) + nbits, \
-                         (unsigned int)temp2, nbits); \
+    code_op \
     \
     cvalue++; \
     zerobits >>= 1; \
   } \
+}
+
+/* Count a ZRL/coefficient symbol (statistics-gathering pass) */
+
+#define COUNT_ZRL_AC_FIRST  { ac_counts[0xF0]++; }
+
+#define COUNT_CODE_AC_FIRST { ac_counts[(r << 4) + nbits]++; }
+
+/* Emit a ZRL/coefficient symbol (data-output pass).  The Huffman code for
+ * the symbol and the magnitude bits of the coefficient are concatenated and
+ * inserted into the bit buffer with a single PUT_BITS() invocation, as in
+ * jchuff.c.
+ */
+
+#define EMIT_ZRL_AC_FIRST { \
+  if (zrl_size == 0) \
+    ERREXIT(cinfo, JERR_HUFF_MISSING_CODE); \
+  PUT_BITS(zrl_code, zrl_size) \
+}
+
+#define EMIT_CODE_AC_FIRST { \
+  symbol = (r << 4) + nbits; \
+  size = actbl->ehufsi[symbol]; \
+  /* if size is 0, caller used an invalid Huffman table entry */ \
+  if (size == 0) \
+    ERREXIT(cinfo, JERR_HUFF_MISSING_CODE); \
+  code = (actbl->ehufco[symbol] << nbits) | \
+         ((unsigned int)temp2 & ((1U << nbits) - 1)); \
+  size += nbits; \
+  PUT_BITS(code, size) \
 }
 
 METHODDEF(boolean)
@@ -840,20 +1004,61 @@ encode_mcu_AC_first(j_compress_ptr cinfo, JBLOCKROW *MCU_data)
 
   /* Encode the AC coefficients per section G.1.2.2, fig. G.3 */
 
-  ENCODE_COEFS_AC_FIRST((void)0;);
+  if (entropy->gather_statistics) {
+    long *ac_counts = entropy->count_ptrs[entropy->ac_tbl_no];
+
+    ENCODE_COEFS_AC_FIRST((void)0;, COUNT_ZRL_AC_FIRST, COUNT_CODE_AC_FIRST);
 
 #if SIZEOF_SIZE_T == 4
-  zerobits = bits[1];
-  if (zerobits) {
-    int diff = ((values + DCTSIZE2 / 2) - cvalue);
-    r = count_zeroes(&zerobits);
-    r += diff;
-    cvalue += r;
-    goto first_iter_ac_first;
-  }
+    zerobits = bits[1];
+    if (zerobits) {
+      int diff = ((values + DCTSIZE2 / 2) - cvalue);
+      r = count_zeroes(&zerobits);
+      r += diff;
+      cvalue += r;
+      goto first_iter_ac_first_gather;
+    }
 
-  ENCODE_COEFS_AC_FIRST(first_iter_ac_first:);
+    ENCODE_COEFS_AC_FIRST(first_iter_ac_first_gather:, COUNT_ZRL_AC_FIRST,
+                          COUNT_CODE_AC_FIRST);
 #endif
+  } else {
+    c_derived_tbl *actbl = entropy->derived_tbls[entropy->ac_tbl_no];
+    unsigned int zrl_code = actbl->ehufco[0xF0];
+    int zrl_size = actbl->ehufsi[0xF0];
+    unsigned int code;
+    int symbol, size;
+    JOCTET _buffer[BUFSIZE], *buffer;
+    bit_buf_type put_buffer = entropy->put_buffer;
+    int free_bits = entropy->free_bits;
+    int localbuf = 0;
+
+#ifdef ZERO_BUFFERS
+    memset(_buffer, 0, sizeof(_buffer));
+#endif
+
+    LOAD_BUFFER()
+
+    ENCODE_COEFS_AC_FIRST((void)0;, EMIT_ZRL_AC_FIRST, EMIT_CODE_AC_FIRST);
+
+#if SIZEOF_SIZE_T == 4
+    zerobits = bits[1];
+    if (zerobits) {
+      int diff = ((values + DCTSIZE2 / 2) - cvalue);
+      r = count_zeroes(&zerobits);
+      r += diff;
+      cvalue += r;
+      goto first_iter_ac_first_emit;
+    }
+
+    ENCODE_COEFS_AC_FIRST(first_iter_ac_first_emit:, EMIT_ZRL_AC_FIRST,
+                          EMIT_CODE_AC_FIRST);
+#endif
+
+    entropy->put_buffer = put_buffer;
+    entropy->free_bits = free_bits;
+    STORE_BUFFER()
+  }
 
   if (cvalue < (values + Sl)) { /* If there are trailing zeroes, */
     entropy->EOBRUN++;          /* count an EOB */

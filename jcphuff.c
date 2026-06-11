@@ -47,6 +47,26 @@
 
 #include "jpeg_nbits.h"
 
+/* The progressive Huffman encoder uses the same bit accumulation scheme as
+ * the baseline Huffman encoder in jchuff.c, accumulating as many bits as
+ * possible in the bit buffer and flushing it in machine-word-sized chunks.
+ */
+
+#if defined(__x86_64__) && defined(__ILP32__)
+typedef unsigned long long bit_buf_type;
+#else
+typedef size_t bit_buf_type;
+#endif
+
+#if (defined(SIZEOF_SIZE_T) && SIZEOF_SIZE_T == 8) || defined(_WIN64) || \
+    (defined(__x86_64__) && defined(__ILP32__))
+#define BIT_BUF_SIZE  64
+#elif (defined(SIZEOF_SIZE_T) && SIZEOF_SIZE_T == 4) || defined(_WIN32)
+#define BIT_BUF_SIZE  32
+#else
+#error Cannot determine word size
+#endif
+
 
 /* Expanded entropy encoder object for progressive Huffman encoding. */
 
@@ -70,8 +90,8 @@ typedef struct {
    */
   JOCTET *next_output_byte;     /* => next byte to write in buffer */
   size_t free_in_buffer;        /* # of byte spaces remaining in buffer */
-  size_t put_buffer;            /* current bit-accumulation buffer */
-  int put_bits;                 /* # of bits now in it */
+  bit_buf_type put_buffer;      /* current bit-accumulation buffer */
+  int free_bits;                /* # of bits available in it */
   j_compress_ptr cinfo;         /* link to cinfo (needed for dump_buffer) */
 
   /* Coding status for DC components */
@@ -276,7 +296,7 @@ start_pass_phuff(j_compress_ptr cinfo, boolean gather_statistics)
 
   /* Initialize bit buffer to empty */
   entropy->put_buffer = 0;
-  entropy->put_bits = 0;
+  entropy->free_bits = BIT_BUF_SIZE;
 
   /* Initialize restart stuff */
   entropy->restarts_to_go = cinfo->restart_interval;
@@ -313,19 +333,73 @@ dump_buffer(phuff_entropy_ptr entropy)
 
 /* Outputting bits to the file */
 
-/* Only the right 24 bits of put_buffer are used; the valid bits are
- * left-justified in this part.  At most 16 bits can be passed to emit_bits
- * in one call, and we never retain more than 7 bits in put_buffer
- * between calls, so 24 bits are sufficient.
+/* Output the entire bit buffer.  If there are no 0xFF bytes in it, then write
+ * it to the output buffer directly.  Otherwise, encode 0xFF as 0xFF 0x00 one
+ * byte at a time.  (Same scheme as the baseline Huffman encoder in jchuff.c,
+ * adapted to this module's destination management.)
  */
 
+LOCAL(void)
+flush_put_buffer(phuff_entropy_ptr entropy, bit_buf_type put_buffer)
+{
+#if BIT_BUF_SIZE == 64
+  if (entropy->free_in_buffer > 8 &&
+      !(put_buffer & 0x8080808080808080 &
+        ~(put_buffer + 0x0101010101010101))) {
+    JOCTET *buffer = entropy->next_output_byte;
+    buffer[0] = (JOCTET)(put_buffer >> 56);
+    buffer[1] = (JOCTET)(put_buffer >> 48);
+    buffer[2] = (JOCTET)(put_buffer >> 40);
+    buffer[3] = (JOCTET)(put_buffer >> 32);
+    buffer[4] = (JOCTET)(put_buffer >> 24);
+    buffer[5] = (JOCTET)(put_buffer >> 16);
+    buffer[6] = (JOCTET)(put_buffer >> 8);
+    buffer[7] = (JOCTET)(put_buffer);
+    entropy->next_output_byte += 8;
+    entropy->free_in_buffer -= 8;
+  } else
+#else
+  if (entropy->free_in_buffer > 4 &&
+      !(put_buffer & 0x80808080 & ~(put_buffer + 0x01010101))) {
+    JOCTET *buffer = entropy->next_output_byte;
+    buffer[0] = (JOCTET)(put_buffer >> 24);
+    buffer[1] = (JOCTET)(put_buffer >> 16);
+    buffer[2] = (JOCTET)(put_buffer >> 8);
+    buffer[3] = (JOCTET)(put_buffer);
+    entropy->next_output_byte += 4;
+    entropy->free_in_buffer -= 4;
+  } else
+#endif
+  {
+    int put_bits = BIT_BUF_SIZE;
+
+    while (put_bits > 0) {
+      int c;
+
+      put_bits -= 8;
+      c = (int)((put_buffer >> put_bits) & 0xFF);
+      emit_byte(entropy, c);
+      if (c == 0xFF) {          /* need to stuff a zero byte? */
+        emit_byte(entropy, 0);
+      }
+    }
+  }
+}
+
+
+/* Insert code into the bit buffer and output the bit buffer if needed.
+ * NOTE: We can't flush with free_bits == 0, since the left shift in
+ * the flush path would have undefined behavior.
+ */
+
+INLINE
 LOCAL(void)
 emit_bits(phuff_entropy_ptr entropy, unsigned int code, int size)
 /* Emit some bits, unless we are in gather mode */
 {
   /* This routine is heavily used, so it's worth coding tightly. */
-  register size_t put_buffer = (size_t)code;
-  register int put_bits = entropy->put_bits;
+  bit_buf_type put_buffer;
+  int free_bits;
 
   /* if size is 0, caller used an invalid Huffman table entry */
   if (size == 0)
@@ -334,36 +408,55 @@ emit_bits(phuff_entropy_ptr entropy, unsigned int code, int size)
   if (entropy->gather_statistics)
     return;                     /* do nothing if we're only getting stats */
 
-  put_buffer &= (((size_t)1) << size) - 1; /* mask off any extra bits in code */
+  put_buffer = entropy->put_buffer;
+  free_bits = entropy->free_bits - size;
+  code &= (((bit_buf_type)1) << size) - 1; /* mask off any extra bits */
 
-  put_bits += size;             /* new number of bits in buffer */
-
-  put_buffer <<= 24 - put_bits; /* align incoming bits */
-
-  put_buffer |= entropy->put_buffer; /* and merge with old buffer contents */
-
-  while (put_bits >= 8) {
-    int c = (int)((put_buffer >> 16) & 0xFF);
-
-    emit_byte(entropy, c);
-    if (c == 0xFF) {            /* need to stuff a zero byte? */
-      emit_byte(entropy, 0);
-    }
-    put_buffer <<= 8;
-    put_bits -= 8;
+  if (free_bits < 0) {
+    /* Fill the bit buffer to capacity with the leading bits from code, then
+     * output the bit buffer and put the remaining bits from code into it.
+     */
+    put_buffer = (put_buffer << (size + free_bits)) | (code >> -free_bits);
+    flush_put_buffer(entropy, put_buffer);
+    free_bits += BIT_BUF_SIZE;
+    put_buffer = code;
+  } else {
+    put_buffer = (put_buffer << size) | code;
   }
 
-  entropy->put_buffer = put_buffer; /* update variables */
-  entropy->put_bits = put_bits;
+  entropy->put_buffer = put_buffer;
+  entropy->free_bits = free_bits;
 }
 
 
 LOCAL(void)
 flush_bits(phuff_entropy_ptr entropy)
 {
-  emit_bits(entropy, 0x7F, 7); /* fill any partial byte with ones */
-  entropy->put_buffer = 0;     /* and reset bit-buffer to empty */
-  entropy->put_bits = 0;
+  bit_buf_type put_buffer = entropy->put_buffer;
+  int put_bits = BIT_BUF_SIZE - entropy->free_bits;
+
+  while (put_bits >= 8) {
+    int c;
+
+    put_bits -= 8;
+    c = (int)((put_buffer >> put_bits) & 0xFF);
+    emit_byte(entropy, c);
+    if (c == 0xFF) {            /* need to stuff a zero byte? */
+      emit_byte(entropy, 0);
+    }
+  }
+  if (put_bits > 0) {
+    /* fill any partial byte with ones */
+    int c = (int)(((put_buffer << (8 - put_bits)) | (0xFF >> put_bits)) & 0xFF);
+
+    emit_byte(entropy, c);
+    if (c == 0xFF) {            /* need to stuff a zero byte? */
+      emit_byte(entropy, 0);
+    }
+  }
+
+  entropy->put_buffer = 0;      /* and reset bit buffer to empty */
+  entropy->free_bits = BIT_BUF_SIZE;
 }
 
 
@@ -371,6 +464,7 @@ flush_bits(phuff_entropy_ptr entropy)
  * Emit (or just count) a Huffman symbol.
  */
 
+INLINE
 LOCAL(void)
 emit_symbol(phuff_entropy_ptr entropy, int tbl_no, int symbol)
 {
@@ -379,6 +473,36 @@ emit_symbol(phuff_entropy_ptr entropy, int tbl_no, int symbol)
   else {
     c_derived_tbl *tbl = entropy->derived_tbls[tbl_no];
     emit_bits(entropy, tbl->ehufco[symbol], tbl->ehufsi[symbol]);
+  }
+}
+
+
+/*
+ * Emit (or just count) a Huffman symbol, followed by nbits of the value, if
+ * nonzero.  Concatenating the Huffman code and the value bits allows them to
+ * be inserted into the bit buffer with a single emit_bits() call (same trick
+ * as the PUT_CODE() macro in jchuff.c.)  The Huffman code is at most 16 bits,
+ * and nbits is at most 15, so the combined size always fits in the bit
+ * buffer.
+ */
+
+INLINE
+LOCAL(void)
+emit_symbol_and_bits(phuff_entropy_ptr entropy, int tbl_no, int symbol,
+                     unsigned int value, int nbits)
+{
+  if (entropy->gather_statistics)
+    entropy->count_ptrs[tbl_no][symbol]++;
+  else {
+    c_derived_tbl *tbl = entropy->derived_tbls[tbl_no];
+    int size = tbl->ehufsi[symbol];
+
+    /* if size is 0, caller used an invalid Huffman table entry */
+    if (size == 0)
+      ERREXIT(entropy->cinfo, JERR_HUFF_MISSING_CODE);
+
+    value &= (((unsigned int)1) << nbits) - 1; /* mask off any extra bits */
+    emit_bits(entropy, (tbl->ehufco[symbol] << nbits) | value, size + nbits);
   }
 }
 
@@ -394,6 +518,25 @@ emit_buffered_bits(phuff_entropy_ptr entropy, char *bufstart,
   if (entropy->gather_statistics)
     return;                     /* no real work */
 
+  /* Pack groups of 8 correction bits (one per char, in emission order) into
+   * a single emit_bits() call.  emit_bits() emits the most significant bit
+   * of code first, so this preserves the bit order.
+   */
+  while (nbits >= 8) {
+    unsigned int code =
+      ((unsigned int)(bufstart[0] & 1) << 7) |
+      ((unsigned int)(bufstart[1] & 1) << 6) |
+      ((unsigned int)(bufstart[2] & 1) << 5) |
+      ((unsigned int)(bufstart[3] & 1) << 4) |
+      ((unsigned int)(bufstart[4] & 1) << 3) |
+      ((unsigned int)(bufstart[5] & 1) << 2) |
+      ((unsigned int)(bufstart[6] & 1) << 1) |
+      ((unsigned int)(bufstart[7] & 1));
+
+    emit_bits(entropy, code, 8);
+    bufstart += 8;
+    nbits -= 8;
+  }
   while (nbits > 0) {
     emit_bits(entropy, (unsigned int)(*bufstart), 1);
     bufstart++;
@@ -418,9 +561,8 @@ emit_eobrun(phuff_entropy_ptr entropy)
     if (nbits > 14)
       ERREXIT(entropy->cinfo, JERR_HUFF_MISSING_CODE);
 
-    emit_symbol(entropy, entropy->ac_tbl_no, nbits << 4);
-    if (nbits)
-      emit_bits(entropy, entropy->EOBRUN, nbits);
+    emit_symbol_and_bits(entropy, entropy->ac_tbl_no, nbits << 4,
+                         entropy->EOBRUN, nbits);
 
     entropy->EOBRUN = 0;
 
@@ -522,13 +664,12 @@ encode_mcu_DC_first(j_compress_ptr cinfo, JBLOCKROW *MCU_data)
     if (nbits > max_coef_bits + 1)
       ERREXIT(cinfo, JERR_BAD_DCT_COEF);
 
-    /* Count/emit the Huffman-coded symbol for the number of bits */
-    emit_symbol(entropy, compptr->dc_tbl_no, nbits);
-
-    /* Emit that number of bits of the value, if positive, */
-    /* or the complement of its magnitude, if negative. */
-    if (nbits)                  /* emit_bits rejects calls with size 0 */
-      emit_bits(entropy, (unsigned int)temp2, nbits);
+    /* Count/emit the Huffman-coded symbol for the number of bits, and emit
+     * that number of bits of the value, if positive, or the complement of
+     * its magnitude, if negative.
+     */
+    emit_symbol_and_bits(entropy, compptr->dc_tbl_no, nbits,
+                         (unsigned int)temp2, nbits);
   }
 
   cinfo->dest->next_output_byte = entropy->next_output_byte;
@@ -633,12 +774,12 @@ label \
     if (nbits > max_coef_bits) \
       ERREXIT(cinfo, JERR_BAD_DCT_COEF); \
     \
-    /* Count/emit Huffman symbol for run length / number of bits */ \
-    emit_symbol(entropy, entropy->ac_tbl_no, (r << 4) + nbits); \
-    \
-    /* Emit that number of bits of the value, if positive, */ \
-    /* or the complement of its magnitude, if negative. */ \
-    emit_bits(entropy, (unsigned int)temp2, nbits); \
+    /* Count/emit Huffman symbol for run length / number of bits, and emit \
+     * that number of bits of the value, if positive, or the complement of \
+     * its magnitude, if negative. \
+     */ \
+    emit_symbol_and_bits(entropy, entropy->ac_tbl_no, (r << 4) + nbits, \
+                         (unsigned int)temp2, nbits); \
     \
     cvalue++; \
     zerobits >>= 1; \
@@ -898,12 +1039,12 @@ label \
     /* Emit any pending EOBRUN and the BE correction bits */ \
     emit_eobrun(entropy); \
     \
-    /* Count/emit Huffman symbol for run length / number of bits */ \
-    emit_symbol(entropy, entropy->ac_tbl_no, (r << 4) + 1); \
-    \
-    /* Emit output bit for newly-nonzero coef */ \
+    /* Count/emit Huffman symbol for run length / number of bits, along with \
+     * the output bit for the newly-nonzero coef \
+     */ \
     temp = signbits & 1; /* ((*block)[jpeg_natural_order_start[k]] < 0) ? 0 : 1 */ \
-    emit_bits(entropy, (unsigned int)temp, 1); \
+    emit_symbol_and_bits(entropy, entropy->ac_tbl_no, (r << 4) + 1, \
+                         (unsigned int)temp, 1); \
     \
     /* Emit buffered correction bits that must be associated with this code */ \
     emit_buffered_bits(entropy, BR_buffer, BR); \

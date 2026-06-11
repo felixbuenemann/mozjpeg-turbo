@@ -942,6 +942,10 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
   float accumulated_zero_dist[DCTSIZE2];
   float accumulated_cost[DCTSIZE2];
   int run_start[DCTSIZE2];
+  int nz_idx[DCTSIZE2];  /* scan positions of nonzero quantized coefs */
+  int num_nz, jj;
+  unsigned long long qval_recip[DCTSIZE2];  /* reciprocals for qval division */
+  int half_q[DCTSIZE2];
   int bi;
   float best_cost;
   int last_coeff_idx; /* position of last nonzero coefficient */
@@ -1008,6 +1012,20 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
     }
   }
   
+  /* Precompute round-up reciprocals so that the quantized value
+   * (x + q/2) / q, with q = 8 * quantval, can be computed with a
+   * multiplication and a shift instead of an integer division.  With
+   * m = ceil(2^39 / q), (n * m) >> 39 == n / q holds exactly for all
+   * dividends n in [0, 2^19), which covers x + q/2 <= 32768 + 4 * 65535.
+   * (The error term of the round-up method is bounded by
+   * (q - 1) * (n_max + q) < 2^39.)
+   */
+  for (i = 0; i < DCTSIZE2; i++) {
+    unsigned int q = 8 * qtbl->quantval[i];
+    qval_recip[i] = ((1ULL << 39) + q - 1) / q;
+    half_q[i] = q >> 1;
+  }
+
   norm = 0.0;
   for (i = 1; i < DCTSIZE2; i++) {
     norm += qtbl->quantval[i] * qtbl->quantval[i];
@@ -1048,8 +1066,18 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
       int q = 8 * qtbl->quantval[0];
       int qval;
       float dc_candidate_dist;
+      int prev_dc_candidate[DC_TRELLIS_MAX_CANDIDATES];
+      float prev_dc_cost[DC_TRELLIS_MAX_CANDIDATES];
 
-      qval = (x + q/2) / q; /* quantized value (round nearest) */
+      if (bi > 0) {
+        for (k = 0; k < dc_trellis_candidates; k++) {
+          prev_dc_candidate[k] = dc_candidate[k][bi-1];
+          prev_dc_cost[k] = accumulated_dc_cost[k][bi-1];
+        }
+      }
+
+      /* quantized value (round nearest) */
+      qval = (int)(((unsigned long long)(x + half_q[0]) * qval_recip[0]) >> 39);
       for (k = 0; k < dc_trellis_candidates; k++) {
         int delta;
         int dc_delta;
@@ -1064,7 +1092,7 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
         delta = dc_candidate[k][bi] * q - x;
         dc_candidate_dist = delta * delta * lambda_dc;
         dc_candidate[k][bi] *= 1 + 2*sign;
-        
+
         /* Take into account DC differences */
         if (coef_blocks_above && src_above && cinfo->master->trellis_delta_dc_weight > 0.0) {
           int dc_above_orig;
@@ -1072,7 +1100,7 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
           int dc_orig;
           int dc_recon;
           float vertical_dist;
-          
+
           dc_above_orig = src_above[bi][0];
           dc_above_recon = coef_blocks_above[bi][0] * q;
           dc_orig = src[bi][0];
@@ -1082,42 +1110,39 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
           vertical_dist = delta * delta * lambda_dc;
           dc_candidate_dist +=  cinfo->master->trellis_delta_dc_weight * (vertical_dist - dc_candidate_dist);
         }
-        
+
         if (bi == 0) {
           dc_delta = dc_candidate[k][bi] - *last_dc_val;
 
           /* Derive number of suffix bits */
-          bits = 0;
-          dc_delta = abs(dc_delta);
-          while (dc_delta) {
-            dc_delta >>= 1;
-            bits++;
-          }
+          bits = JPEG_NBITS(abs(dc_delta));
           cost = bits + dctbl->ehufsi[bits] + dc_candidate_dist;
           accumulated_dc_cost[k][0] = cost;
           dc_cost_backtrack[k][0] = -1;
         } else {
+          int cand_k = dc_candidate[k][bi];
+          float best_cost_k;
+          int best_l = 0;
+
           for (l = 0; l < dc_trellis_candidates; l++) {
-            dc_delta = dc_candidate[k][bi] - dc_candidate[l][bi-1];
+            dc_delta = cand_k - prev_dc_candidate[l];
 
             /* Derive number of suffix bits */
-            bits = 0;
-            dc_delta = abs(dc_delta);
-            while (dc_delta) {
-              dc_delta >>= 1;
-              bits++;
-            }
-            cost = bits + dctbl->ehufsi[bits] + dc_candidate_dist + accumulated_dc_cost[l][bi-1];
-            if (l == 0 || cost < accumulated_dc_cost[k][bi]) {
-              accumulated_dc_cost[k][bi] = cost;
-              dc_cost_backtrack[k][bi] = l;
+            bits = JPEG_NBITS(abs(dc_delta));
+            cost = bits + dctbl->ehufsi[bits] + dc_candidate_dist + prev_dc_cost[l];
+            if (l == 0 || cost < best_cost_k) {
+              best_cost_k = cost;
+              best_l = l;
             }
           }
+          accumulated_dc_cost[k][bi] = best_cost_k;
+          dc_cost_backtrack[k][bi] = best_l;
         }
       }
     }
 
     /* Do AC coefficients */
+    num_nz = 0;
     for (i = Ss; i <= Se; i++) {
       int z = jpeg_natural_order[i];
 
@@ -1131,8 +1156,9 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
       int qval;
       
       accumulated_zero_dist[i] = x * x * lambda * lambda_tbl[z] + accumulated_zero_dist[i-1];
-      
-      qval = (x + q/2) / q; /* quantized value (round nearest) */
+
+      /* quantized value (round nearest) */
+      qval = (int)(((unsigned long long)(x + half_q[z]) * qval_recip[z]) >> 39);
 
       if (qval == 0) {
         coef_blocks[bi][z] = 0;
@@ -1152,57 +1178,84 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
         candidate_dist[k] = delta * delta * lambda * lambda_tbl[z];
       }
       
-      accumulated_cost[i] = 1e38;
-      
-      for (j = Ss-1; j < i; j++) {
-        int zz = jpeg_natural_order[j];
-        if (j != Ss-1 && coef_blocks[bi][zz] == 0)
-          continue;
-        
-        zero_run = i - 1 - j;
-        if ((zero_run >> 4) && actbl->ehufsi[0xf0] == 0)
-          continue;
-        
-        run_bits = (zero_run >> 4) * actbl->ehufsi[0xf0];
-        zero_run &= 15;
+      {
+        /* Only positions with a nonzero quantized coefficient (and the
+         * starting position Ss-1) can end a zero run, so it suffices to
+         * iterate over those.  This computes exactly the same costs in
+         * exactly the same order as iterating j over [Ss-1, i) and skipping
+         * positions that hold a zero coefficient.
+         */
+        float azd_im1 = accumulated_zero_dist[i-1];
+        float best_cost_i = 1e38;
+        int best_qval = 0, best_j = 0, improved = 0;
 
-        for (k = 0; k < num_candidates; k++) {
-          int coef_bits = actbl->ehufsi[16 * zero_run + candidate_bits[k]];
-          if (coef_bits == 0)
+        for (jj = -1; jj < num_nz; jj++) {
+          float acost_j, azd_j;
+
+          j = (jj < 0) ? Ss - 1 : nz_idx[jj];
+
+          zero_run = i - 1 - j;
+          if ((zero_run >> 4) && actbl->ehufsi[0xf0] == 0)
             continue;
-          
-          rate = coef_bits + candidate_bits[k] + run_bits;
-          cost = rate + candidate_dist[k];
-          cost += accumulated_zero_dist[i-1] - accumulated_zero_dist[j] + accumulated_cost[j];
-          
-          if (cost < accumulated_cost[i]) {
-            coef_blocks[bi][z] = (candidate[k] ^ sign) - sign;
-            accumulated_cost[i] = cost;
-            run_start[i] = j;
+
+          run_bits = (zero_run >> 4) * actbl->ehufsi[0xf0];
+          zero_run &= 15;
+
+          acost_j = accumulated_cost[j];
+          azd_j = accumulated_zero_dist[j];
+
+          for (k = 0; k < num_candidates; k++) {
+            int coef_bits = actbl->ehufsi[16 * zero_run + candidate_bits[k]];
+            if (coef_bits == 0)
+              continue;
+
+            rate = coef_bits + candidate_bits[k] + run_bits;
+            cost = rate + candidate_dist[k];
+            cost += azd_im1 - azd_j + acost_j;
+
+            if (cost < best_cost_i) {
+              best_qval = candidate[k];
+              best_cost_i = cost;
+              best_j = j;
+              improved = 1;
+            }
           }
         }
+
+        accumulated_cost[i] = best_cost_i;
+        if (improved) {
+          coef_blocks[bi][z] = (best_qval ^ sign) - sign;
+          run_start[i] = best_j;
+        }
       }
+
+      if (coef_blocks[bi][z] != 0)
+        nz_idx[num_nz++] = i;
     }
     
     last_coeff_idx = Ss-1;
     best_cost = accumulated_zero_dist[Se] + actbl->ehufsi[0];
     cost_all_zeros = accumulated_zero_dist[Se];
     best_cost_skip = cost_all_zeros;
-    
-    for (i = Ss; i <= Se; i++) {
-      int z = jpeg_natural_order[i];
-      if (coef_blocks[bi][z] != 0) {
-        float cost = accumulated_cost[i] + accumulated_zero_dist[Se] - accumulated_zero_dist[i];
-        float cost_wo_eob = cost;
-        
-        if (i < Se)
-          cost += actbl->ehufsi[0];
-        
-        if (cost < best_cost) {
-          best_cost = cost;
-          last_coeff_idx = i;
-          best_cost_skip = cost_wo_eob;
-        }
+
+    /* The nonzero-coefficient positions recorded during the loop above are
+     * exactly the positions this loop would otherwise find by scanning all
+     * of [Ss, Se].
+     */
+    for (jj = 0; jj < num_nz; jj++) {
+      float cost, cost_wo_eob;
+
+      i = nz_idx[jj];
+      cost = accumulated_cost[i] + accumulated_zero_dist[Se] - accumulated_zero_dist[i];
+      cost_wo_eob = cost;
+
+      if (i < Se)
+        cost += actbl->ehufsi[0];
+
+      if (cost < best_cost) {
+        best_cost = cost;
+        last_coeff_idx = i;
+        best_cost_skip = cost_wo_eob;
       }
     }
     

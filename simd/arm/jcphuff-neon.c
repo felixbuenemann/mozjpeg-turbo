@@ -412,12 +412,6 @@ int jsimd_encode_mcu_AC_refine_prepare_neon
   (const JCOEF *block, const int *jpeg_natural_order_start, int Sl, int Al,
    UJCOEF *absvalues, size_t *bits)
 {
-  /* Temporary storage buffers for data used to compute the signbits bitmap and
-   * the end-of-block (EOB) position
-   */
-  uint8_t coef_sign_bits[64];
-  uint8_t coef_eq1_bits[64];
-
 #if defined(__aarch64__) || defined(_M_ARM64)
 
   const uint8_t *zigzag_byte_offsets = jsimd_zigzag_byte_offsets +
@@ -425,6 +419,7 @@ int jsimd_encode_mcu_AC_refine_prepare_neon
   const int16x8_t neg_al = vdupq_n_s16(-Al);
   const int groups = (Sl + 15) / 16;
   int i;
+  uint64_t bitmap;
 
 #ifdef HAVE_VLD1Q_U8_X4
   const uint8x16x4_t block_lo = vld1q_u8_x4((const uint8_t *)block);
@@ -445,19 +440,38 @@ int jsimd_encode_mcu_AC_refine_prepare_neon
   } };
 #endif
 
+  /* { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 } */
+  const uint8x8_t bitmap_mask =
+    vreinterpret_u8_u64(vmov_n_u64(0x8040201008040201));
+  /* Level-1 bitmap value of a group of 16 zero coefficients */
+  const uint8x8_t all_zero_eq0_bits = vpadd_u8(bitmap_mask, bitmap_mask);
+  /* All three bitmaps are accumulated in registers while the coefficients
+   * are processed: a set zerobits/signbits/EOB bit at this stage means that
+   * the corresponding coefficient is zero/negative/equal to 1.  (For
+   * unprocessed groups, a zero coefficient is assumed, as if the
+   * coefficient storage had been zero-filled.)
+   */
+  uint8x8_t eq0_bits[4] = {
+    all_zero_eq0_bits, all_zero_eq0_bits, all_zero_eq0_bits, all_zero_eq0_bits
+  };
+  uint8x8_t sign_bits[4] = {
+    vdup_n_u8(0), vdup_n_u8(0), vdup_n_u8(0), vdup_n_u8(0)
+  };
+  uint8x8_t eq1_bits[4] = {
+    vdup_n_u8(0), vdup_n_u8(0), vdup_n_u8(0), vdup_n_u8(0)
+  };
+
   for (i = 0; i < groups; i++) {
     uint8x16_t idx1 = vld1q_u8(zigzag_byte_offsets + 32 * i);
     uint8x16_t idx2 = vld1q_u8(zigzag_byte_offsets + 32 * i + 16);
     int16x8_t coefs1 = jsimd_gather_coefs(block_lo, block_hi, idx1);
     int16x8_t coefs2 = jsimd_gather_coefs(block_lo, block_hi, idx2);
 
-    /* Compute and store data for signbits bitmap. */
+    /* Compute data for signbits bitmap. */
     uint8x8_t sign_coefs1 =
       vmovn_u16(vreinterpretq_u16_s16(vshrq_n_s16(coefs1, 15)));
     uint8x8_t sign_coefs2 =
       vmovn_u16(vreinterpretq_u16_s16(vshrq_n_s16(coefs2, 15)));
-    vst1_u8(coef_sign_bits + 16 * i, sign_coefs1);
-    vst1_u8(coef_sign_bits + 16 * i + DCTSIZE, sign_coefs2);
 
     /* Compute absolute value of coefficients and apply point transform Al. */
     uint16x8_t abs_coefs1 = vreinterpretq_u16_s16(vabsq_s16(coefs1));
@@ -467,27 +481,77 @@ int jsimd_encode_mcu_AC_refine_prepare_neon
     vst1q_u16(absvalues + 16 * i, abs_coefs1);
     vst1q_u16(absvalues + 16 * i + DCTSIZE, abs_coefs2);
 
-    /* Test whether transformed coefficient values == 1 (used to find EOB
-     * position.)
+    /* Accumulate the zerobits, signbits, and EOB (coefficient == 1)
+     * bitmaps in registers.
      */
-    uint8x8_t coefs_eq11 = vmovn_u16(vceqq_u16(abs_coefs1, vdupq_n_u16(1)));
-    uint8x8_t coefs_eq12 = vmovn_u16(vceqq_u16(abs_coefs2, vdupq_n_u16(1)));
-    vst1_u8(coef_eq1_bits + 16 * i, coefs_eq11);
-    vst1_u8(coef_eq1_bits + 16 * i + DCTSIZE, coefs_eq12);
+    {
+      uint8x8_t eq0_1 = vmovn_u16(vceqq_u16(abs_coefs1, vdupq_n_u16(0)));
+      uint8x8_t eq0_2 = vmovn_u16(vceqq_u16(abs_coefs2, vdupq_n_u16(0)));
+      uint8x8_t eq1_1 = vmovn_u16(vceqq_u16(abs_coefs1, vdupq_n_u16(1)));
+      uint8x8_t eq1_2 = vmovn_u16(vceqq_u16(abs_coefs2, vdupq_n_u16(1)));
+
+      eq0_bits[i] = vpadd_u8(vand_u8(eq0_1, bitmap_mask),
+                             vand_u8(eq0_2, bitmap_mask));
+      sign_bits[i] = vpadd_u8(vand_u8(sign_coefs1, bitmap_mask),
+                              vand_u8(sign_coefs2, bitmap_mask));
+      eq1_bits[i] = vpadd_u8(vand_u8(eq1_1, bitmap_mask),
+                             vand_u8(eq1_2, bitmap_mask));
+    }
   }
 
-  /* Zero remaining memory in blocks.  (Values beyond Sl that the gather
-   * filled in within the last group are masked out of the zerobits and EOB
-   * bitmaps below; absvalues beyond Sl are only read for coefficients whose
+  /* Construct zerobits bitmap.  (absvalues beyond Sl, which the table-based
+   * gather may have filled in within the last group, are masked off here
+   * and in the EOB bitmap, and are only read for coefficients whose
    * zerobits bit is set.)
    */
-  for (i = 16 * groups; i < DCTSIZE2; i += DCTSIZE) {
-    vst1q_u16(absvalues + i, vdupq_n_u16(0));
-    vst1_u8(coef_sign_bits + i, vdup_n_u8(0));
-    vst1_u8(coef_eq1_bits + i, vdup_n_u8(0));
+  {
+    uint8x8_t bitmap_rows_0123 = vpadd_u8(eq0_bits[0], eq0_bits[1]);
+    uint8x8_t bitmap_rows_4567 = vpadd_u8(eq0_bits[2], eq0_bits[3]);
+    uint8x8_t bitmap_all = vpadd_u8(bitmap_rows_0123, bitmap_rows_4567);
+
+    bitmap = vget_lane_u64(vreinterpret_u64_u8(bitmap_all), 0);
+    /* Store zerobits bitmap. */
+    bits[0] = ~bitmap & (((uint64_t)1 << Sl) - 1);
+  }
+
+  /* Construct signbits bitmap. */
+  {
+    uint8x8_t bitmap_rows_0123 = vpadd_u8(sign_bits[0], sign_bits[1]);
+    uint8x8_t bitmap_rows_4567 = vpadd_u8(sign_bits[2], sign_bits[3]);
+    uint8x8_t bitmap_all = vpadd_u8(bitmap_rows_0123, bitmap_rows_4567);
+
+    bitmap = vget_lane_u64(vreinterpret_u64_u8(bitmap_all), 0);
+    /* Store signbits bitmap. */
+    bits[1] = ~bitmap;
+  }
+
+  /* Construct bitmap to find EOB position (the index of the last coefficient
+   * equal to 1.)
+   */
+  {
+    uint8x8_t bitmap_rows_0123 = vpadd_u8(eq1_bits[0], eq1_bits[1]);
+    uint8x8_t bitmap_rows_4567 = vpadd_u8(eq1_bits[2], eq1_bits[3]);
+    uint8x8_t bitmap_all = vpadd_u8(bitmap_rows_0123, bitmap_rows_4567);
+
+    bitmap = vget_lane_u64(vreinterpret_u64_u8(bitmap_all), 0) &
+             (((uint64_t)1 << Sl) - 1);
+  }
+
+  /* Return EOB position. */
+  if (bitmap == 0) {
+    /* EOB position is defined to be 0 if all coefficients != 1. */
+    return 0;
+  } else {
+    return 63 - BUILTIN_CLZLL(bitmap);
   }
 
 #else
+
+  /* Temporary storage buffers for data used to compute the signbits bitmap
+   * and the end-of-block (EOB) position
+   */
+  uint8_t coef_sign_bits[64];
+  uint8_t coef_eq1_bits[64];
 
   UJCOEF *absvalues_ptr = absvalues;
   uint8_t *coef_sign_bits_ptr = coef_sign_bits;
@@ -677,7 +741,6 @@ int jsimd_encode_mcu_AC_refine_prepare_neon
     eq1_bits_ptr += 8;
   }
 
-#endif
 
   /* Construct zerobits bitmap. */
   uint16x8_t abs_row0 = vld1q_u16(absvalues + 0 * DCTSIZE);
@@ -832,5 +895,7 @@ int jsimd_encode_mcu_AC_refine_prepare_neon
   } else {
     return 31 - BUILTIN_CLZ(bitmap0);
   }
+#endif
+
 #endif
 }

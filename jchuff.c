@@ -37,6 +37,20 @@
 #include <limits.h>
 #include "jpeg_nbits.h"
 
+#ifdef HAVE_INTRIN_H
+#include <intrin.h>
+#ifdef _MSC_VER
+#ifdef HAVE_BITSCANFORWARD64
+#pragma intrinsic(_BitScanForward64)
+#endif
+#ifdef HAVE_BITSCANFORWARD
+#pragma intrinsic(_BitScanForward)
+#endif
+#endif
+#endif
+
+#define PAD(v, p)  ((v + (p) - 1) & (~((p) - 1)))
+
 
 /* Expanded entropy encoder object for Huffman encoding.
  *
@@ -103,6 +117,7 @@ typedef struct {
 
 #ifdef WITH_SIMD
   int simd;
+  boolean simd_gather;          /* use SIMD-assisted statistics gathering */
 #endif
 } huff_entropy_encoder;
 
@@ -150,6 +165,9 @@ start_pass_huff(j_compress_ptr cinfo, boolean gather_statistics)
 #ifdef ENTROPY_OPT_SUPPORTED
     entropy->pub.encode_mcu = encode_mcu_gather;
     entropy->pub.finish_pass = finish_pass_gather;
+#ifdef WITH_SIMD
+    entropy->simd_gather = jsimd_can_encode_mcu_AC_first_prepare();
+#endif
 #else
     ERREXIT(cinfo, JERR_NOT_COMPILED);
 #endif
@@ -878,6 +896,148 @@ htest_one_block(j_compress_ptr cinfo, JCOEFPTR block, int last_dc_val,
 }
 
 
+#ifdef WITH_SIMD
+
+/* Count bit loop zeroes (same as count_zeroes() in jcphuff.c) */
+INLINE
+LOCAL(int)
+htest_count_zeroes(size_t *x)
+{
+#if defined(HAVE_BUILTIN_CTZL)
+  int result;
+  result = __builtin_ctzl(*x);
+  *x >>= result;
+#elif defined(HAVE_BITSCANFORWARD64)
+  unsigned long result;
+  _BitScanForward64(&result, *x);
+  *x >>= result;
+#elif defined(HAVE_BITSCANFORWARD)
+  unsigned long result;
+  _BitScanForward(&result, *x);
+  *x >>= result;
+#else
+  int result = 0;
+  while ((*x & 1) == 0) {
+    ++result;
+    *x >>= 1;
+  }
+#endif
+  return (int)result;
+}
+
+
+/*
+ * SIMD-assisted version of htest_one_block(): the absolute values and the
+ * nonzero-coefficient bitmap of the AC band are computed by the same SIMD
+ * routine that prepares data for the progressive AC encoder
+ * (jsimd_encode_mcu_AC_first_prepare() with Al = 0), and only the nonzero
+ * coefficients are visited.  The symbol counts are identical to those that
+ * htest_one_block() computes.
+ */
+
+LOCAL(void)
+htest_one_block_simd(j_compress_ptr cinfo, JCOEFPTR block, int last_dc_val,
+                     long dc_counts[], long ac_counts[])
+{
+  register int temp;
+  register int nbits;
+  register int r;
+  int max_coef_bits = cinfo->data_precision + 2;
+  UJCOEF values_unaligned[2 * DCTSIZE2 + 15];
+  UJCOEF *values;
+  const UJCOEF *cvalue;
+  size_t zerobits;
+  size_t bits[8 / SIZEOF_SIZE_T];
+
+#ifdef ZERO_BUFFERS
+  memset(values_unaligned, 0, sizeof(values_unaligned));
+  memset(bits, 0, sizeof(bits));
+#endif
+
+  /* Encode the DC coefficient difference per section F.1.2.1 */
+
+  temp = block[0] - last_dc_val;
+  if (temp < 0)
+    temp = -temp;
+
+  /* Find the number of bits needed for the magnitude of the coefficient */
+  nbits = JPEG_NBITS(temp);
+  /* Check for out-of-range coefficient values.
+   * Since we're encoding a difference, the range limit is twice as much.
+   */
+  if (nbits > max_coef_bits + 1)
+    ERREXIT(cinfo, JERR_BAD_DCT_COEF);
+
+  /* Count the Huffman symbol for the number of bits */
+  dc_counts[nbits]++;
+
+  /* Encode the AC coefficients per section F.1.2.2 */
+
+  cvalue = values = (UJCOEF *)PAD((JUINTPTR)values_unaligned, 16);
+
+  jsimd_encode_mcu_AC_first_prepare(block, jpeg_natural_order + 1,
+                                    DCTSIZE2 - 1, 0, values, bits);
+
+  zerobits = bits[0];
+#if SIZEOF_SIZE_T == 4
+  while (zerobits) {
+    r = htest_count_zeroes(&zerobits);
+    cvalue += r;
+    while (r > 15) {
+      ac_counts[0xF0]++;
+      r -= 16;
+    }
+    nbits = JPEG_NBITS_NONZERO(cvalue[0]);
+    if (nbits > max_coef_bits)
+      ERREXIT(cinfo, JERR_BAD_DCT_COEF);
+    ac_counts[(r << 4) + nbits]++;
+    cvalue++;
+    zerobits >>= 1;
+  }
+  {
+    int diff = (int)((values + DCTSIZE2 / 2) - cvalue);
+
+    zerobits = bits[1];
+    if (zerobits) {
+      r = htest_count_zeroes(&zerobits);
+      r += diff;
+      cvalue += r;
+      while (r > 15) {
+        ac_counts[0xF0]++;
+        r -= 16;
+      }
+      nbits = JPEG_NBITS_NONZERO(cvalue[0]);
+      if (nbits > max_coef_bits)
+        ERREXIT(cinfo, JERR_BAD_DCT_COEF);
+      ac_counts[(r << 4) + nbits]++;
+      cvalue++;
+      zerobits >>= 1;
+    }
+  }
+#endif
+  while (zerobits) {
+    r = htest_count_zeroes(&zerobits);
+    cvalue += r;
+    while (r > 15) {
+      ac_counts[0xF0]++;
+      r -= 16;
+    }
+    nbits = JPEG_NBITS_NONZERO(cvalue[0]);
+    if (nbits > max_coef_bits)
+      ERREXIT(cinfo, JERR_BAD_DCT_COEF);
+    ac_counts[(r << 4) + nbits]++;
+    cvalue++;
+    zerobits >>= 1;
+  }
+
+  /* If the last coef(s) were zero, emit an end-of-block code */
+  if (cvalue < values + DCTSIZE2 - 1)
+    ac_counts[0]++;
+}
+
+#endif /* WITH_SIMD */
+
+
 /*
  * Trial-encode one MCU's worth of Huffman-compressed coefficients.
  * No data is actually output, so no suspension return is possible.
@@ -905,6 +1065,14 @@ encode_mcu_gather(j_compress_ptr cinfo, JBLOCKROW *MCU_data)
   for (blkn = 0; blkn < cinfo->blocks_in_MCU; blkn++) {
     ci = cinfo->MCU_membership[blkn];
     compptr = cinfo->cur_comp_info[ci];
+#ifdef WITH_SIMD
+    if (entropy->simd_gather)
+      htest_one_block_simd(cinfo, MCU_data[blkn][0],
+                           entropy->saved.last_dc_val[ci],
+                           entropy->dc_count_ptrs[compptr->dc_tbl_no],
+                           entropy->ac_count_ptrs[compptr->ac_tbl_no]);
+    else
+#endif
     htest_one_block(cinfo, MCU_data[blkn][0], entropy->saved.last_dc_val[ci],
                     entropy->dc_count_ptrs[compptr->dc_tbl_no],
                     entropy->ac_count_ptrs[compptr->ac_tbl_no]);

@@ -962,6 +962,114 @@ select_scans (j_compress_ptr cinfo, int next_scan_number)
 }
 
 /*
+ * Decide whether the data-output pass of the current scan can be skipped.
+ *
+ * When optimizing scans, most scans are encoded only so that their sizes can
+ * be compared in select_scans().  After the statistics-gathering pass of a
+ * scan, cinfo->master->scan_size_lower_bound holds the exact number of
+ * entropy-coded bytes (rounded down) with which the scan's symbols will be
+ * encoded; markers, byte stuffing, and correction bits only add to the
+ * actual size.  If the size comparison in which this scan participates must
+ * fail even when the scan's not-yet-measured size (and those of any
+ * not-yet-encoded scans in its group) are replaced with lower bounds (or
+ * zero), then the scan can never be selected, its buffer can never be
+ * copied to the output, and its recorded size is only used in that one
+ * failing comparison -- so the data-output pass can be skipped and the
+ * lower bound recorded as the scan's size without changing the compressed
+ * output.
+ *
+ * Scans that can be selected for output (the first scan, refinement scans,
+ * DC scans, the no-split candidates, and the final scan) are never skipped.
+ */
+
+LOCAL(boolean)
+scan_emit_provably_useless(j_compress_ptr cinfo)
+{
+  my_master_ptr master = (my_master_ptr)cinfo->master;
+  int n = master->scan_number;
+  unsigned long lb = cinfo->master->scan_size_lower_bound;
+  int luma_freq_split_scan_start = cinfo->master->num_scans_luma_dc +
+                                   3 * cinfo->master->Al_max_luma + 2;
+  int chroma_freq_split_scan_start = cinfo->master->num_scans_luma +
+                                     cinfo->master->num_scans_chroma_dc +
+                                     (6 * cinfo->master->Al_max_chroma + 4);
+  int base_scan_idx = cinfo->master->num_scans_luma +
+                      cinfo->master->num_scans_chroma_dc;
+  unsigned long cost;
+  int Al, i, m;
+
+  if (lb == 0 || n >= cinfo->num_scans - 1)
+    return FALSE;
+
+  /* The scan index arithmetic below mirrors select_scans(), which assumes
+   * the scan script layout that jpeg_simple_progression() generates when
+   * optimize_scans is enabled (one luma DC scan.)
+   */
+  if (cinfo->master->num_scans_luma_dc != 1)
+    return FALSE;
+
+  if (n >= 1 && n < luma_freq_split_scan_start) {
+    /* Luma successive-approximation search: levels of 3 scans, of which the
+     * first two are compared against the best cost and the third is the
+     * refinement scan (which can be selected for output.)
+     */
+    m = (n - 1) % 3;
+    Al = (n - 1) / 3;
+    if (m == 2 || Al == 0)
+      return FALSE;
+    cost = lb;
+    if (m == 1)
+      cost += master->scan_size[n-1];
+    for (i = 0; i < Al; i++)
+      cost += master->scan_size[3 + 3*i];
+    return cost >= master->best_cost;
+
+  } else if (n > luma_freq_split_scan_start &&
+             n < cinfo->master->num_scans_luma) {
+    /* Luma frequency-split search: pairs of scans, compared against the
+     * best cost (initially that of the unsplit scan, which is never
+     * skipped.)
+     */
+    cost = lb;
+    if ((n - luma_freq_split_scan_start) % 2 == 0)
+      cost += master->scan_size[n-1];
+    return cost >= master->best_cost;
+
+  } else if (n >= base_scan_idx && n < chroma_freq_split_scan_start) {
+    /* Chroma successive-approximation search: levels of 6 scans, of which
+     * the first four are compared against the best cost and the last two
+     * are the refinement scans.
+     */
+    m = (n - base_scan_idx) % 6;
+    Al = (n - base_scan_idx) / 6;
+    if (m >= 4 || Al == 0)
+      return FALSE;
+    cost = lb;
+    for (i = 0; i < m; i++)
+      cost += master->scan_size[base_scan_idx + 6*Al + i];
+    for (i = 0; i < Al; i++) {
+      cost += master->scan_size[base_scan_idx + 4 + 6*i];
+      cost += master->scan_size[base_scan_idx + 5 + 6*i];
+    }
+    return cost >= master->best_cost;
+
+  } else if (n > chroma_freq_split_scan_start + 1 && n < cinfo->num_scans) {
+    /* Chroma frequency-split search: groups of 4 scans, compared against
+     * the best cost (initially that of the unsplit scan pair, which is
+     * never skipped.)
+     */
+    m = (n - chroma_freq_split_scan_start - 2) % 4;
+    cost = lb;
+    for (i = 0; i < m; i++)
+      cost += master->scan_size[n - m + i];
+    return cost >= master->best_cost;
+  }
+
+  return FALSE;
+}
+
+
+/*
  * Finish up at end of pass.
  */
 
@@ -992,6 +1100,25 @@ finish_pass_master(j_compress_ptr cinfo)
   case huff_opt_pass:
     /* next pass is always output of current scan */
     master->pass_type = (master->pass_number < master->pass_number_scan_opt_base-1) ? trellis_pass : output_pass;
+    if (master->pass_type == output_pass && cinfo->master->optimize_scans &&
+        !cinfo->arith_code && scan_emit_provably_useless(cinfo)) {
+      /* Record the scan's size lower bound in place of its actual size and
+       * skip the data-output pass, mirroring what the output_pass case
+       * below would have done.  The pass numbering remains canonical: the
+       * skipped pass is accounted for with an extra increment, unless
+       * select_scans() terminated a search and set pass_number itself.
+       */
+      int prev_pass_number = master->pass_number;
+
+      master->scan_size[master->scan_number] =
+        cinfo->master->scan_size_lower_bound;
+      master->scan_buffer[master->scan_number] = NULL;
+      select_scans(cinfo, master->scan_number + 1);
+      if (master->pass_number == prev_pass_number)
+        master->pass_number++;
+      master->scan_number++;
+      master->pass_type = huff_opt_pass;
+    }
     break;
   case output_pass:
     /* next pass is either optimization or output of next scan */

@@ -127,6 +127,11 @@ struct jpeg_comp_master {
   int Al_max_luma; /* maximum value of Al tested when optimizing scans (luma) */
   int Al_max_chroma; /* maximum value of Al tested when optimizing scans (chroma) */
 
+  unsigned long scan_size_lower_bound; /* lower bound (in bytes) on the encoded
+                                          size of the current scan, computed
+                                          from the statistics-gathering pass
+                                          [not exposed] */
+
   float lambda_log_scale1;
   float lambda_log_scale2;
   

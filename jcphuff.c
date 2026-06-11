@@ -1546,6 +1546,8 @@ finish_pass_gather_phuff(j_compress_ptr cinfo)
   jpeg_component_info *compptr;
   JHUFF_TBL **htblptr;
   boolean did[NUM_HUFF_TBLS];
+  long counts[257];
+  unsigned long total_bits = 0;
 
   /* Flush out buffered data (all we care about is counting the EOB symbol) */
   emit_eobrun(entropy);
@@ -1573,10 +1575,44 @@ finish_pass_gather_phuff(j_compress_ptr cinfo)
         htblptr = &cinfo->ac_huff_tbl_ptrs[tbl];
       if (*htblptr == NULL)
         *htblptr = jpeg_alloc_huff_table((j_common_ptr)cinfo);
+      memcpy(counts, entropy->count_ptrs[tbl], sizeof(counts));
       jpeg_gen_optimal_table(cinfo, *htblptr, entropy->count_ptrs[tbl]);
       did[tbl] = TRUE;
+
+      /* Compute the exact number of bits with which the symbols counted
+       * during this pass, along with their appended magnitude/EOB-run bits,
+       * will be entropy-coded using the Huffman table that was just
+       * generated.  This is a lower bound on the encoded size of the scan
+       * (markers, byte stuffing, and -- in AC refinement scans -- correction
+       * bits only add to it), which jcmaster.c uses to skip data-output
+       * passes whose result provably cannot affect scan selection.
+       */
+      {
+        JHUFF_TBL *htbl = *htblptr;
+        int bl, j, idx = 0;
+
+        for (bl = 1; bl <= 16; bl++) {
+          for (j = 0; j < htbl->bits[bl]; j++) {
+            int sym = htbl->huffval[idx++];
+            int extra;
+
+            if (is_DC_band)
+              extra = sym;            /* DC difference magnitude bits */
+            else if (sym & 15)
+              extra = sym & 15;       /* AC coefficient magnitude bits */
+            else if ((sym >> 4) == 15)
+              extra = 0;              /* ZRL */
+            else
+              extra = sym >> 4;       /* EOB run length bits */
+            total_bits +=
+              (unsigned long)counts[sym] * (unsigned long)(bl + extra);
+          }
+        }
+      }
     }
   }
+
+  cinfo->master->scan_size_lower_bound = total_bits / 8;
 }
 
 

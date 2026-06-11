@@ -548,15 +548,20 @@ flush_bits(phuff_entropy_ptr entropy)
 }
 
 /* Although it is exceedingly rare, it is possible for an encoded MCU (one
- * block in an AC scan) to be larger than the 128-byte unencoded block.  Up to
- * 63 coefficients are coded with at most 16 + 14 bits each, so an encoded
- * block cannot be larger than 30 * 63 / 8 bytes plus byte stuffing plus the
- * granularity of bit-buffer flushes.
+ * block in an AC scan) to be larger than the 128-byte unencoded block.  In an
+ * AC initial scan, up to 63 coefficients are coded with at most 16 + 14 bits
+ * each, so an encoded block cannot be larger than 30 * 63 / 8 bytes plus byte
+ * stuffing plus the granularity of bit-buffer flushes.  In an AC refinement
+ * scan, an encoded block cannot be larger than an EOB run (16 + 14 bits), up
+ * to MAX_CORR_BITS buffered correction bits, and up to 63 newly-nonzero
+ * coefficients with at most 16 + 1 bits each -- about 270 bytes, plus byte
+ * stuffing plus the granularity of bit-buffer flushes.
  */
 #define BUFSIZE  (DCTSIZE2 * 8)
+#define BUFSIZE_AC_REFINE  (DCTSIZE2 * 16)
 
-#define LOAD_BUFFER() { \
-  if (entropy->free_in_buffer < BUFSIZE) { \
+#define LOAD_BUFFER(bufsize) { \
+  if (entropy->free_in_buffer < (bufsize)) { \
     localbuf = 1; \
     buffer = _buffer; \
   } else \
@@ -1037,7 +1042,7 @@ encode_mcu_AC_first(j_compress_ptr cinfo, JBLOCKROW *MCU_data)
     memset(_buffer, 0, sizeof(_buffer));
 #endif
 
-    LOAD_BUFFER()
+    LOAD_BUFFER(BUFSIZE)
 
     ENCODE_COEFS_AC_FIRST((void)0;, EMIT_ZRL_AC_FIRST, EMIT_CODE_AC_FIRST);
 
@@ -1206,7 +1211,13 @@ encode_mcu_AC_refine_prepare(const JCOEF *block,
  * MCU encoding for AC successive approximation refinement scan.
  */
 
-#define ENCODE_COEFS_AC_REFINE(label) { \
+/* The body of the per-coefficient encoding loop, parameterized on the
+ * operations performed for a pending EOB run, a run-length-16 (ZRL) code, a
+ * newly-nonzero coefficient code, and buffered correction bits, so that the
+ * statistics-gathering and the data-output passes can each use a specialized
+ * loop.
+ */
+#define ENCODE_COEFS_AC_REFINE(label, eobrun_op, zrl_op, code_op, corr_op) { \
   while (zerobits) { \
     idx = count_zeroes(&zerobits); \
     r += idx; \
@@ -1216,12 +1227,12 @@ label \
     /* Emit any required ZRLs, but not if they can be folded into EOB */ \
     while (r > 15 && (cabsvalue <= EOBPTR)) { \
       /* emit any pending EOBRUN and the BE correction bits */ \
-      emit_eobrun(entropy); \
+      eobrun_op \
       /* Emit ZRL */ \
-      emit_symbol(entropy, entropy->ac_tbl_no, 0xF0); \
+      zrl_op \
       r -= 16; \
       /* Emit buffered correction bits that must be associated with ZRL */ \
-      emit_buffered_bits(entropy, BR_buffer, BR); \
+      corr_op \
       BR_buffer = entropy->bit_buffer; /* BE bits are gone now */ \
       BR = 0; \
     } \
@@ -1242,17 +1253,16 @@ label \
     } \
     \
     /* Emit any pending EOBRUN and the BE correction bits */ \
-    emit_eobrun(entropy); \
+    eobrun_op \
     \
     /* Count/emit Huffman symbol for run length / number of bits, along with \
      * the output bit for the newly-nonzero coef \
      */ \
     temp = signbits & 1; /* ((*block)[jpeg_natural_order_start[k]] < 0) ? 0 : 1 */ \
-    emit_symbol_and_bits(entropy, entropy->ac_tbl_no, (r << 4) + 1, \
-                         (unsigned int)temp, 1); \
+    code_op \
     \
     /* Emit buffered correction bits that must be associated with this code */ \
-    emit_buffered_bits(entropy, BR_buffer, BR); \
+    corr_op \
     BR_buffer = entropy->bit_buffer; /* BE bits are gone now */ \
     BR = 0; \
     r = 0;                      /* reset zero run length */ \
@@ -1260,6 +1270,93 @@ label \
     zerobits >>= 1; \
   } \
 }
+
+/* Count an EOB run/ZRL/coefficient symbol (statistics-gathering pass).
+ * emit_eobrun() only updates the statistics counts in this mode, and
+ * correction bits are not counted.
+ */
+
+#define COUNT_EOBRUN_AC_REFINE  { emit_eobrun(entropy); }
+
+#define COUNT_ZRL_AC_REFINE     { ac_counts[0xF0]++; }
+
+#define COUNT_CODE_AC_REFINE    { ac_counts[(r << 4) + 1]++; }
+
+#define COUNT_CORR_AC_REFINE    { }
+
+/* Emit an EOB run/ZRL/coefficient symbol/buffered correction bits
+ * (data-output pass), inserting bits into the bit buffer held in local
+ * variables.  These are functionally identical to emit_eobrun(),
+ * emit_symbol(), emit_symbol_and_bits(), and emit_buffered_bits().
+ */
+
+#define PUT_BUFFERED_BITS(bufstart, count) { \
+  const char *br_ptr = (bufstart); \
+  unsigned int br_count = (count); \
+  while (br_count >= 8) { \
+    code = ((unsigned int)(br_ptr[0] & 1) << 7) | \
+           ((unsigned int)(br_ptr[1] & 1) << 6) | \
+           ((unsigned int)(br_ptr[2] & 1) << 5) | \
+           ((unsigned int)(br_ptr[3] & 1) << 4) | \
+           ((unsigned int)(br_ptr[4] & 1) << 3) | \
+           ((unsigned int)(br_ptr[5] & 1) << 2) | \
+           ((unsigned int)(br_ptr[6] & 1) << 1) | \
+           ((unsigned int)(br_ptr[7] & 1)); \
+    PUT_BITS(code, 8) \
+    br_ptr += 8; \
+    br_count -= 8; \
+  } \
+  while (br_count > 0) { \
+    code = (unsigned int)(*br_ptr & 1); \
+    PUT_BITS(code, 1) \
+    br_ptr++; \
+    br_count--; \
+  } \
+}
+
+#define EMIT_EOBRUN_AC_REFINE { \
+  if (entropy->EOBRUN > 0) { \
+    unsigned int eobrun = entropy->EOBRUN; \
+    \
+    nbits = JPEG_NBITS_NONZERO(eobrun) - 1; \
+    /* safety check: shouldn't happen given limited correction-bit buffer */ \
+    if (nbits > 14) \
+      ERREXIT(cinfo, JERR_HUFF_MISSING_CODE); \
+    \
+    symbol = nbits << 4; \
+    size = actbl->ehufsi[symbol]; \
+    if (size == 0) \
+      ERREXIT(cinfo, JERR_HUFF_MISSING_CODE); \
+    code = (actbl->ehufco[symbol] << nbits) | \
+           (eobrun & ((1U << nbits) - 1)); \
+    size += nbits; \
+    PUT_BITS(code, size) \
+    entropy->EOBRUN = 0; \
+    \
+    /* Emit any buffered correction bits */ \
+    PUT_BUFFERED_BITS(entropy->bit_buffer, entropy->BE) \
+    entropy->BE = 0; \
+  } \
+}
+
+#define EMIT_ZRL_AC_REFINE { \
+  if (zrl_size == 0) \
+    ERREXIT(cinfo, JERR_HUFF_MISSING_CODE); \
+  PUT_BITS(zrl_code, zrl_size) \
+}
+
+#define EMIT_CODE_AC_REFINE { \
+  symbol = (r << 4) + 1; \
+  size = actbl->ehufsi[symbol]; \
+  /* if size is 0, caller used an invalid Huffman table entry */ \
+  if (size == 0) \
+    ERREXIT(cinfo, JERR_HUFF_MISSING_CODE); \
+  code = (actbl->ehufco[symbol] << 1) | (unsigned int)temp; \
+  size += 1; \
+  PUT_BITS(code, size) \
+}
+
+#define EMIT_CORR_AC_REFINE  PUT_BUFFERED_BITS(BR_buffer, BR)
 
 METHODDEF(boolean)
 encode_mcu_AC_refine(j_compress_ptr cinfo, JBLOCKROW *MCU_data)
@@ -1313,24 +1410,76 @@ encode_mcu_AC_refine(j_compress_ptr cinfo, JBLOCKROW *MCU_data)
 #else
   signbits = bits[2];
 #endif
-  ENCODE_COEFS_AC_REFINE((void)0;);
+
+  if (entropy->gather_statistics) {
+    long *ac_counts = entropy->count_ptrs[entropy->ac_tbl_no];
+
+    ENCODE_COEFS_AC_REFINE((void)0;, COUNT_EOBRUN_AC_REFINE,
+                           COUNT_ZRL_AC_REFINE, COUNT_CODE_AC_REFINE,
+                           COUNT_CORR_AC_REFINE);
 
 #if SIZEOF_SIZE_T == 4
-  zerobits = bits[1];
-  signbits = bits[3];
+    zerobits = bits[1];
+    signbits = bits[3];
 
-  if (zerobits) {
-    int diff = ((absvalues + DCTSIZE2 / 2) - cabsvalue);
-    idx = count_zeroes(&zerobits);
-    signbits >>= idx;
-    idx += diff;
-    r += idx;
-    cabsvalue += idx;
-    goto first_iter_ac_refine;
-  }
+    if (zerobits) {
+      int diff = ((absvalues + DCTSIZE2 / 2) - cabsvalue);
+      idx = count_zeroes(&zerobits);
+      signbits >>= idx;
+      idx += diff;
+      r += idx;
+      cabsvalue += idx;
+      goto first_iter_ac_refine_gather;
+    }
 
-  ENCODE_COEFS_AC_REFINE(first_iter_ac_refine:);
+    ENCODE_COEFS_AC_REFINE(first_iter_ac_refine_gather:,
+                           COUNT_EOBRUN_AC_REFINE, COUNT_ZRL_AC_REFINE,
+                           COUNT_CODE_AC_REFINE, COUNT_CORR_AC_REFINE);
 #endif
+  } else {
+    c_derived_tbl *actbl = entropy->derived_tbls[entropy->ac_tbl_no];
+    unsigned int zrl_code = actbl->ehufco[0xF0];
+    int zrl_size = actbl->ehufsi[0xF0];
+    unsigned int code;
+    int symbol, size, nbits;
+    JOCTET _buffer[BUFSIZE_AC_REFINE], *buffer;
+    bit_buf_type put_buffer = entropy->put_buffer;
+    int free_bits = entropy->free_bits;
+    int localbuf = 0;
+
+#ifdef ZERO_BUFFERS
+    memset(_buffer, 0, sizeof(_buffer));
+#endif
+
+    LOAD_BUFFER(BUFSIZE_AC_REFINE)
+
+    ENCODE_COEFS_AC_REFINE((void)0;, EMIT_EOBRUN_AC_REFINE,
+                           EMIT_ZRL_AC_REFINE, EMIT_CODE_AC_REFINE,
+                           EMIT_CORR_AC_REFINE);
+
+#if SIZEOF_SIZE_T == 4
+    zerobits = bits[1];
+    signbits = bits[3];
+
+    if (zerobits) {
+      int diff = ((absvalues + DCTSIZE2 / 2) - cabsvalue);
+      idx = count_zeroes(&zerobits);
+      signbits >>= idx;
+      idx += diff;
+      r += idx;
+      cabsvalue += idx;
+      goto first_iter_ac_refine_emit;
+    }
+
+    ENCODE_COEFS_AC_REFINE(first_iter_ac_refine_emit:,
+                           EMIT_EOBRUN_AC_REFINE, EMIT_ZRL_AC_REFINE,
+                           EMIT_CODE_AC_REFINE, EMIT_CORR_AC_REFINE);
+#endif
+
+    entropy->put_buffer = put_buffer;
+    entropy->free_bits = free_bits;
+    STORE_BUFFER()
+  }
 
   r |= (int)((absvalues + Sl) - cabsvalue);
 

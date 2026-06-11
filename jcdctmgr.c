@@ -40,6 +40,24 @@
 #include <arm_neon.h>
 #endif
 
+/* Likewise on x86-64, using AVX2.  Unlike Neon, AVX2 is not part of the
+ * baseline ISA, so the vectorized search is compiled into a separate
+ * function with a target attribute and is only entered when runtime CPU
+ * detection reports AVX2 support.  It shares the caveat above about
+ * (negligible) output differences relative to the scalar search.
+ */
+#if defined(WITH_SIMD) && BITS_IN_JSAMPLE == 8 && \
+    (defined(__x86_64__) || defined(_M_X64))
+#define TRELLIS_AVX2  1
+#include <immintrin.h>
+#include <stdint.h>
+#if defined(__GNUC__) || defined(__clang__)
+#define AVX2_TARGET  __attribute__((target("avx2")))
+#else
+#define AVX2_TARGET  /* MSVC allows AVX2 intrinsics without a target option */
+#endif
+#endif
+
 
 /* Private subobject for this module */
 
@@ -946,6 +964,114 @@ LOCAL(int) get_num_dc_trellis_candidates(int dc_quantval) {
 }
 
 #if BITS_IN_JSAMPLE == 8
+
+#ifdef TRELLIS_AVX2
+
+/* Defined in the SIMD support code (simd/x86_64/jsimdcpu.asm) */
+EXTERN(unsigned int) jpeg_simd_cpu_support(void);
+#define TRELLIS_JSIMD_AVX2  0x80  /* must match JSIMD_AVX2 in simd/jsimd.h */
+
+LOCAL(int)
+trellis_avx2_supported(void)
+{
+  static THREAD_LOCAL int supported = -1;
+
+  if (supported < 0) {
+    supported = (jpeg_simd_cpu_support() & TRELLIS_JSIMD_AVX2) != 0;
+#ifndef NO_GETENV
+    /* Honor the same overrides as the SIMD dispatch in simd/x86_64/jsimd.c
+     * so that the vectorized search can be disabled for testing.
+     */
+    {
+      char env[2] = { 0 };
+
+      if (!GETENV_S(env, 2, "JSIMD_FORCESSE2") && !strcmp(env, "1"))
+        supported = 0;
+      if (!GETENV_S(env, 2, "JSIMD_FORCENONE") && !strcmp(env, "1"))
+        supported = 0;
+    }
+#endif
+  }
+  return supported;
+}
+
+/* Evaluate the candidate run starts 8 at a time; this is the AVX2
+ * counterpart of the Neon search in quantize_trellis() below and evaluates
+ * the same candidate set in the same order.  The code length of the
+ * run/size symbol is looked up with PSHUFB from the per-size slice tables;
+ * lanes without a usable code are forced to a huge cost.
+ */
+AVX2_TARGET
+LOCAL(void)
+trellis_search_avx2(const int16_t *nz_pos16, const float *nz_base,
+                    int vec_full, int i, float azd_im1, int zrl_len,
+                    const __m128i *ehufsi_slices, const int *candidate,
+                    const float *candidate_dist, int num_candidates,
+                    float *best_cost_i, int *best_qval, int *best_j,
+                    int *improved)
+{
+  const __m128i zero = _mm_setzero_si128();
+  const __m128i skipfix = _mm_set1_epi16(zrl_len == 0 ? -1 : 0);
+  const __m128i im1 = _mm_set1_epi16((int16_t)(i - 1));
+  const __m128i fifteen = _mm_set1_epi16(15);
+  const __m128i zrlv = _mm_set1_epi16((int16_t)zrl_len);
+  const __m256 azdv = _mm256_set1_ps(azd_im1);
+  const __m256 big = _mm256_set1_ps(1e38f);
+  int cb_base, k;
+
+  for (cb_base = 0; cb_base < vec_full; cb_base += 8) {
+    __m128i jv = _mm_loadu_si128((const __m128i *)(nz_pos16 + cb_base));
+    __m128i zr = _mm_sub_epi16(im1, jv);
+    __m128i zrh = _mm_srli_epi16(zr, 4);
+    __m128i runbits = _mm_mullo_epi16(zrh, zrlv);
+    __m128i zr15 = _mm_packus_epi16(_mm_and_si128(zr, fifteen), zero);
+    /* lanes with zero_run >= 16 are unusable if there is no ZRL code */
+    __m128i skip = _mm_andnot_si128(_mm_cmpeq_epi16(zrh, zero), skipfix);
+    __m256 basev = _mm256_add_ps(_mm256_loadu_ps(nz_base + cb_base), azdv);
+
+    for (k = 0; k < num_candidates; k++) {
+      __m128i cb8 = _mm_shuffle_epi8(ehufsi_slices[k + 1], zr15);
+      __m128i cb16 = _mm_unpacklo_epi8(cb8, zero);
+      __m128i invalid = _mm_or_si128(_mm_cmpeq_epi16(cb16, zero), skip);
+      __m128i ratei = _mm_add_epi16(_mm_add_epi16(cb16, runbits),
+                                    _mm_set1_epi16((int16_t)(k + 1)));
+      __m256 costv = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(ratei));
+      float m;
+
+      costv = _mm256_add_ps(_mm256_add_ps(costv,
+                                          _mm256_set1_ps(candidate_dist[k])),
+                            basev);
+      costv = _mm256_blendv_ps(costv, big,
+                               _mm256_castsi256_ps(
+                                 _mm256_cvtepi16_epi32(invalid)));
+
+      {
+        __m128 m4 = _mm_min_ps(_mm256_castps256_ps128(costv),
+                               _mm256_extractf128_ps(costv, 1));
+        m4 = _mm_min_ps(m4, _mm_movehl_ps(m4, m4));
+        m4 = _mm_min_ss(m4, _mm_shuffle_ps(m4, m4, 1));
+        m = _mm_cvtss_f32(m4);
+      }
+
+      if (m < *best_cost_i) {
+        float lane_costs[8];
+        int lane;
+
+        _mm256_storeu_ps(lane_costs, costv);
+        for (lane = 0; lane < 7; lane++)
+          if (lane_costs[lane] == m)
+            break;
+        *best_cost_i = m;
+        *best_qval = candidate[k];
+        *best_j = nz_pos16[cb_base + lane];
+        *improved = 1;
+      }
+    }
+  }
+}
+
+#endif /* TRELLIS_AVX2 */
+
 GLOBAL(void)
 quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actbl, JBLOCKROW coef_blocks, JBLOCKROW src, JDIMENSION num_blocks,
                  JQUANT_TBL * qtbl, double *norm_src, double *norm_coef, JCOEF *last_dc_val,
@@ -962,12 +1088,19 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
   int ac_zero_thresh[DCTSIZE2];
   double pow2_scale1, pow2_scale2, pow2_scale1_m12;
   int zero_block_check;
-#ifdef TRELLIS_NEON
+#if defined(TRELLIS_NEON) || defined(TRELLIS_AVX2)
   int16_t nz_pos16[DCTSIZE2];   /* nz_idx, as int16 */
   float nz_base[DCTSIZE2];      /* accumulated_cost - accumulated_zero_dist
                                    at the nz_idx positions */
+#ifdef TRELLIS_NEON
   uint8x16_t ehufsi_slices[11]; /* ehufsi[16*r + b] for r = 0..15, b = 1..10 */
+#else
+  __m128i ehufsi_slices[11];    /* ehufsi[16*r + b] for r = 0..15, b = 1..10 */
+#endif
   int zrl_len;
+#endif
+#ifdef TRELLIS_AVX2
+  int use_avx2 = trellis_avx2_supported();
 #endif
   int bi;
   float best_cost;
@@ -1066,18 +1199,22 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
                       !cinfo->master->trellis_eob_opt &&
                       !cinfo->master->trellis_q_opt);
 
-#ifdef TRELLIS_NEON
+#if defined(TRELLIS_NEON) || defined(TRELLIS_AVX2)
   /* For each possible number of coefficient magnitude bits b, gather the
    * code lengths of the 16 run/size symbols (r << 4) + b into one 16-byte
    * table, so that the vectorized run-start search can look code lengths up
-   * for 8 candidate run starts with a single TBL instruction.
+   * for 8 candidate run starts with a single TBL/PSHUFB instruction.
    */
   for (k = 1; k <= 10; k++) {
     uint8_t slice[16];
 
     for (i = 0; i < 16; i++)
       slice[i] = (uint8_t)actbl->ehufsi[16 * i + k];
+#ifdef TRELLIS_NEON
     ehufsi_slices[k] = vld1q_u8(slice);
+#else
+    ehufsi_slices[k] = _mm_loadu_si128((const __m128i *)slice);
+#endif
   }
   zrl_len = actbl->ehufsi[0xf0];
 #endif
@@ -1331,12 +1468,26 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
             }
           }
         }
+#elif defined(TRELLIS_AVX2)
+        int vec_full = 0;
+
+        if (use_avx2 && num_nz >= 8) {
+          /* Evaluate the candidate run starts 8 at a time, as above on
+           * Neon.  The start state (j = Ss-1) and the partial tail are
+           * handled by the scalar loop below.
+           */
+          vec_full = num_nz & ~7;
+          trellis_search_avx2(nz_pos16, nz_base, vec_full, i, azd_im1,
+                              zrl_len, ehufsi_slices, candidate,
+                              candidate_dist, num_candidates,
+                              &best_cost_i, &best_qval, &best_j, &improved);
+        }
 #endif
 
         for (jj = -1; jj < num_nz; jj++) {
           float acost_j, azd_j;
 
-#ifdef TRELLIS_NEON
+#if defined(TRELLIS_NEON) || defined(TRELLIS_AVX2)
           if (jj == 0 && vec_full) {
             jj = vec_full;      /* covered by the vectorized search */
             if (jj >= num_nz)
@@ -1382,7 +1533,7 @@ quantize_trellis(j_compress_ptr cinfo, c_derived_tbl *dctbl, c_derived_tbl *actb
       }
 
       if (coef_blocks[bi][z] != 0) {
-#ifdef TRELLIS_NEON
+#if defined(TRELLIS_NEON) || defined(TRELLIS_AVX2)
         nz_pos16[num_nz] = (int16_t)i;
         nz_base[num_nz] = accumulated_cost[i] - accumulated_zero_dist[i];
 #endif

@@ -955,6 +955,62 @@ label \
   PUT_BITS(code, size) \
 }
 
+/* Insert a group of buffered correction bits, or a pending EOB run with its
+ * buffered correction bits, into the bit buffer held in local variables.
+ * These are functionally identical to emit_buffered_bits() and
+ * emit_eobrun().
+ */
+
+#define PUT_BUFFERED_BITS(bufstart, count) { \
+  const char *br_ptr = (bufstart); \
+  unsigned int br_count = (count); \
+  while (br_count >= 8) { \
+    code = ((unsigned int)(br_ptr[0] & 1) << 7) | \
+           ((unsigned int)(br_ptr[1] & 1) << 6) | \
+           ((unsigned int)(br_ptr[2] & 1) << 5) | \
+           ((unsigned int)(br_ptr[3] & 1) << 4) | \
+           ((unsigned int)(br_ptr[4] & 1) << 3) | \
+           ((unsigned int)(br_ptr[5] & 1) << 2) | \
+           ((unsigned int)(br_ptr[6] & 1) << 1) | \
+           ((unsigned int)(br_ptr[7] & 1)); \
+    PUT_BITS(code, 8) \
+    br_ptr += 8; \
+    br_count -= 8; \
+  } \
+  while (br_count > 0) { \
+    code = (unsigned int)(*br_ptr & 1); \
+    PUT_BITS(code, 1) \
+    br_ptr++; \
+    br_count--; \
+  } \
+}
+
+#define EMIT_PENDING_EOBRUN { \
+  if (entropy->EOBRUN > 0) { \
+    unsigned int eobrun = entropy->EOBRUN; \
+    \
+    nbits = JPEG_NBITS_NONZERO(eobrun) - 1; \
+    /* safety check: shouldn't happen given limited correction-bit buffer */ \
+    if (nbits > 14) \
+      ERREXIT(cinfo, JERR_HUFF_MISSING_CODE); \
+    \
+    symbol = nbits << 4; \
+    size = actbl->ehufsi[symbol]; \
+    if (size == 0) \
+      ERREXIT(cinfo, JERR_HUFF_MISSING_CODE); \
+    code = (actbl->ehufco[symbol] << nbits) | \
+           (eobrun & ((1U << nbits) - 1)); \
+    size += nbits; \
+    PUT_BITS(code, size) \
+    entropy->EOBRUN = 0; \
+    \
+    /* Emit any buffered correction bits */ \
+    PUT_BUFFERED_BITS(entropy->bit_buffer, entropy->BE) \
+    entropy->BE = 0; \
+  } \
+}
+
+
 METHODDEF(boolean)
 encode_mcu_AC_first(j_compress_ptr cinfo, JBLOCKROW *MCU_data)
 {
@@ -999,18 +1055,18 @@ encode_mcu_AC_first(j_compress_ptr cinfo, JBLOCKROW *MCU_data)
   zerobits |= bits[1];
 #endif
 
-  /* Emit any pending EOBRUN */
-  if (zerobits && (entropy->EOBRUN > 0))
-    emit_eobrun(entropy);
-
-#if SIZEOF_SIZE_T == 4
-  zerobits = bits[0];
-#endif
-
   /* Encode the AC coefficients per section G.1.2.2, fig. G.3 */
 
   if (entropy->gather_statistics) {
     long *ac_counts = entropy->count_ptrs[entropy->ac_tbl_no];
+
+    /* Count any pending EOBRUN */
+    if (zerobits && (entropy->EOBRUN > 0))
+      emit_eobrun(entropy);
+
+#if SIZEOF_SIZE_T == 4
+    zerobits = bits[0];
+#endif
 
     ENCODE_COEFS_AC_FIRST((void)0;, COUNT_ZRL_AC_FIRST, COUNT_CODE_AC_FIRST);
 
@@ -1043,6 +1099,17 @@ encode_mcu_AC_first(j_compress_ptr cinfo, JBLOCKROW *MCU_data)
 #endif
 
     LOAD_BUFFER(BUFSIZE)
+
+    /* Emit any pending EOBRUN.  (In an AC initial scan, the correction-bit
+     * buffer is always empty, so EMIT_PENDING_EOBRUN emits at most the EOB
+     * run symbol and its appended run length bits.)
+     */
+    if (zerobits && (entropy->EOBRUN > 0))
+      EMIT_PENDING_EOBRUN
+
+#if SIZEOF_SIZE_T == 4
+    zerobits = bits[0];
+#endif
 
     ENCODE_COEFS_AC_FIRST((void)0;, EMIT_ZRL_AC_FIRST, EMIT_CODE_AC_FIRST);
 
@@ -1290,55 +1357,6 @@ label \
  * emit_symbol(), emit_symbol_and_bits(), and emit_buffered_bits().
  */
 
-#define PUT_BUFFERED_BITS(bufstart, count) { \
-  const char *br_ptr = (bufstart); \
-  unsigned int br_count = (count); \
-  while (br_count >= 8) { \
-    code = ((unsigned int)(br_ptr[0] & 1) << 7) | \
-           ((unsigned int)(br_ptr[1] & 1) << 6) | \
-           ((unsigned int)(br_ptr[2] & 1) << 5) | \
-           ((unsigned int)(br_ptr[3] & 1) << 4) | \
-           ((unsigned int)(br_ptr[4] & 1) << 3) | \
-           ((unsigned int)(br_ptr[5] & 1) << 2) | \
-           ((unsigned int)(br_ptr[6] & 1) << 1) | \
-           ((unsigned int)(br_ptr[7] & 1)); \
-    PUT_BITS(code, 8) \
-    br_ptr += 8; \
-    br_count -= 8; \
-  } \
-  while (br_count > 0) { \
-    code = (unsigned int)(*br_ptr & 1); \
-    PUT_BITS(code, 1) \
-    br_ptr++; \
-    br_count--; \
-  } \
-}
-
-#define EMIT_EOBRUN_AC_REFINE { \
-  if (entropy->EOBRUN > 0) { \
-    unsigned int eobrun = entropy->EOBRUN; \
-    \
-    nbits = JPEG_NBITS_NONZERO(eobrun) - 1; \
-    /* safety check: shouldn't happen given limited correction-bit buffer */ \
-    if (nbits > 14) \
-      ERREXIT(cinfo, JERR_HUFF_MISSING_CODE); \
-    \
-    symbol = nbits << 4; \
-    size = actbl->ehufsi[symbol]; \
-    if (size == 0) \
-      ERREXIT(cinfo, JERR_HUFF_MISSING_CODE); \
-    code = (actbl->ehufco[symbol] << nbits) | \
-           (eobrun & ((1U << nbits) - 1)); \
-    size += nbits; \
-    PUT_BITS(code, size) \
-    entropy->EOBRUN = 0; \
-    \
-    /* Emit any buffered correction bits */ \
-    PUT_BUFFERED_BITS(entropy->bit_buffer, entropy->BE) \
-    entropy->BE = 0; \
-  } \
-}
-
 #define EMIT_ZRL_AC_REFINE { \
   if (zrl_size == 0) \
     ERREXIT(cinfo, JERR_HUFF_MISSING_CODE); \
@@ -1453,7 +1471,7 @@ encode_mcu_AC_refine(j_compress_ptr cinfo, JBLOCKROW *MCU_data)
 
     LOAD_BUFFER(BUFSIZE_AC_REFINE)
 
-    ENCODE_COEFS_AC_REFINE((void)0;, EMIT_EOBRUN_AC_REFINE,
+    ENCODE_COEFS_AC_REFINE((void)0;, EMIT_PENDING_EOBRUN,
                            EMIT_ZRL_AC_REFINE, EMIT_CODE_AC_REFINE,
                            EMIT_CORR_AC_REFINE);
 
@@ -1472,7 +1490,7 @@ encode_mcu_AC_refine(j_compress_ptr cinfo, JBLOCKROW *MCU_data)
     }
 
     ENCODE_COEFS_AC_REFINE(first_iter_ac_refine_emit:,
-                           EMIT_EOBRUN_AC_REFINE, EMIT_ZRL_AC_REFINE,
+                           EMIT_PENDING_EOBRUN, EMIT_ZRL_AC_REFINE,
                            EMIT_CODE_AC_REFINE, EMIT_CORR_AC_REFINE);
 #endif
 

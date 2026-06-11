@@ -474,12 +474,76 @@ compress_trellis_pass (j_compress_ptr cinfo, JSAMPIMAGE input_buf)
         }
       }
     }
+
+    if (cinfo->master->fold_gather && cinfo->master->trellis_pass_final) {
+      /* This is the component's last trellis pass, so its coefficients
+       * just became final: accumulate the statistics of the final
+       * sequential scan for this iMCU row while the blocks are still in
+       * cache.  The blocks are visited in the order in which the final
+       * interleaved scan encodes this component's blocks (including the
+       * dummy blocks created above), and the DC predictor is reset at the
+       * final scan's restart intervals, so the accumulated counts match
+       * those of the skipped statistics-gathering pass exactly.
+       */
+      long *dc_counts = cinfo->master->fold_dc_counts[compptr->dc_tbl_no];
+      long *ac_counts = cinfo->master->fold_ac_counts[compptr->ac_tbl_no];
+      int cindex = compptr->component_index;
+      int last_dc = cinfo->master->fold_last_dc[cindex];
+      int mcu_w, mcu_h, yindex, xindex;
+      JDIMENSION mcus_across, mcu_col;
+      unsigned int restart;
+
+      if (cinfo->num_components == 1) {
+        /* Single-component scan: one block per MCU, no dummy blocks. */
+        mcu_w = mcu_h = 1;
+        mcus_across = compptr->width_in_blocks;
+      } else {
+        mcu_w = compptr->h_samp_factor;
+        mcu_h = compptr->v_samp_factor;
+        mcus_across = (compptr->width_in_blocks + mcu_w - 1) / mcu_w;
+      }
+      /* Restart interval of the final scan, in its MCUs (the conversion
+       * from rows matches per_scan_setup() for that scan.)
+       */
+      if (cinfo->restart_in_rows > 0) {
+        long nominal = (long)cinfo->restart_in_rows * (long)mcus_across;
+        restart = (unsigned int)MIN(nominal, 65535L);
+      } else
+        restart = cinfo->restart_interval;
+
+      for (mcu_col = 0; mcu_col < mcus_across; mcu_col++) {
+        if (restart &&
+            (coef->iMCU_row_num * mcus_across + mcu_col) % restart == 0)
+          last_dc = 0;          /* DC prediction restarts with this MCU */
+        for (yindex = 0; yindex < mcu_h; yindex++) {
+          JBLOCKROW mcu_blocks = buffer[yindex] +
+                                 (JDIMENSION)mcu_col * (JDIMENSION)mcu_w;
+          for (xindex = 0; xindex < mcu_w; xindex++) {
+            jpeg_fold_count_block(cinfo, mcu_blocks[xindex], last_dc,
+                                  dc_counts, ac_counts);
+            last_dc = mcu_blocks[xindex][0];
+          }
+        }
+      }
+      cinfo->master->fold_last_dc[cindex] = last_dc;
+    }
+  }
+
+  if (cinfo->master->fold_gather && cinfo->master->trellis_pass_final) {
+    /* The statistics this pass would gather below are only used to refresh
+     * the Huffman tables for another trellis pass over the same component,
+     * and this was the component's last one: skip the gather and just
+     * advance to the next iMCU row.
+     */
+    coef->iMCU_row_num++;
+    start_iMCU_row(cinfo);
+    return TRUE;
   }
 
   /* NB: compress_output will increment iMCU_row_num if successful.
    * A suspension return will result in redoing all the work above next time.
    */
-  
+
   /* Emit data to the entropy encoder, sharing code with subsequent passes */
   return compress_output(cinfo, input_buf);
 }
@@ -507,6 +571,11 @@ compress_output(j_compress_ptr cinfo, _JSAMPIMAGE input_buf)
   if (cinfo->master->par_scan_replay)
     return TRUE;
 #endif
+  /* Likewise when the statistics of this scan were already accumulated
+   * during the trellis passes (folded gathering.)
+   */
+  if (cinfo->master->fold_replay)
+    return TRUE;
   JDIMENSION MCU_col_num;       /* index of current MCU within row */
   int blkn, ci, xindex, yindex, yoffset;
   JDIMENSION start_col;

@@ -617,6 +617,8 @@ prepare_for_pass(j_compress_ptr cinfo)
 #ifdef WITH_SCAN_OPT_THREADS
   cinfo->master->par_scan_replay = FALSE;
 #endif
+  cinfo->master->trellis_pass_final = FALSE;
+  cinfo->master->fold_replay = FALSE;
   cinfo->master->trellis_passes =
     master->pass_number < master->pass_number_scan_opt_base;
 
@@ -671,6 +673,14 @@ prepare_for_pass(j_compress_ptr cinfo)
         cinfo->master->lossless) {
       (*cinfo->entropy->start_pass) (cinfo, TRUE);
       (*cinfo->coef->start_pass) (cinfo, JBUF_CRANK_DEST);
+      if (cinfo->master->fold_gather && cinfo->master->fold_counts_ready &&
+          master->pass_number == master->pass_number_scan_opt_base) {
+        /* The statistics of this scan were accumulated during the trellis
+         * passes: install them and let the pass run as a no-op.
+         */
+        jpeg_fold_inject_counts(cinfo);
+        cinfo->master->fold_replay = TRUE;
+      }
       master->pub.call_pass_startup = FALSE;
       break;
     }
@@ -741,6 +751,20 @@ prepare_for_pass(j_compress_ptr cinfo)
           cinfo->master->norm_coef[i][j] = 0.0;
         }
       }
+    }
+    if (cinfo->master->fold_gather) {
+      /* The last trellis pass of each component finalizes its coefficients,
+       * so the statistics of the final scan are accumulated there
+       * (jccoefct.c).  Trellis passes for one component come in groups of
+       * 2 (or 4 with use_scans_in_trellis) per trellis loop, alternating
+       * with statistics passes, and the requantization pass that final-
+       * izes the component is the last pass of its group.
+       */
+      int group = (cinfo->master->use_scans_in_trellis ? 4 : 2) *
+                  cinfo->master->trellis_num_loops;
+
+      cinfo->master->trellis_pass_final =
+        (master->pass_number % group == group - 1);
     }
     (*cinfo->entropy->start_pass) (cinfo, !cinfo->arith_code);
     (*cinfo->coef->start_pass) (cinfo, JBUF_REQUANT);
@@ -1131,12 +1155,18 @@ finish_pass_master(j_compress_ptr cinfo)
    * either to analyze statistics or to flush its output buffer.
    * (Not when replaying a precomputed scan, though: nothing was encoded,
    * and the arithmetic coder's end-of-pass call would flush termination
-   * bytes into the destination.)
+   * bytes into the destination.  Likewise not when a trellis pass folded
+   * its statistics gathering: the pass gathered no symbols, and the
+   * Huffman tables its statistics would have refreshed are regenerated
+   * from the folded counts before they are next used.)
    */
+  if (
 #ifdef WITH_SCAN_OPT_THREADS
-  if (!cinfo->master->par_scan_replay)
+      !cinfo->master->par_scan_replay &&
 #endif
-  (*cinfo->entropy->finish_pass) (cinfo);
+      !(master->pass_type == trellis_pass && cinfo->master->fold_gather &&
+        cinfo->master->trellis_pass_final))
+    (*cinfo->entropy->finish_pass) (cinfo);
 
   /* Update state for next pass */
   switch (master->pass_type) {
@@ -1202,7 +1232,11 @@ finish_pass_master(j_compress_ptr cinfo)
       master->pass_type = huff_opt_pass;
     else
       master->pass_type = (master->pass_number < master->pass_number_scan_opt_base-1) ? trellis_pass : output_pass;
-      
+
+    if (cinfo->master->fold_gather &&
+        master->pass_number == master->pass_number_scan_opt_base - 1)
+      cinfo->master->fold_counts_ready = TRUE;
+
     if ((master->pass_number + 1) %
         (cinfo->num_components * (cinfo->master->use_scans_in_trellis ? 4 : 2)) == 0 &&
         cinfo->master->trellis_q_opt) {
@@ -1335,6 +1369,63 @@ jinit_c_master_control(j_compress_ptr cinfo, boolean transcode_only)
         cinfo->master->trellis_num_loops + 1;
     master->total_passes += master->pass_number_scan_opt_base;
 }
+
+  /* Folded statistics gathering: for a single sequential scan with trellis
+   * quantization and Huffman optimization, the statistics of the final scan
+   * can be accumulated during each component's last trellis pass, and the
+   * separate statistics-gathering pass over the whole coefficient buffer
+   * becomes a no-op.  (For a single-component image, the final scan is
+   * non-interleaved, so its MCU geometry only matches the accumulation
+   * order when no subsampling is configured.)
+   */
+  cinfo->master->fold_gather = FALSE;
+  cinfo->master->trellis_pass_final = FALSE;
+  cinfo->master->fold_counts_ready = FALSE;
+  cinfo->master->fold_replay = FALSE;
+#if BITS_IN_JSAMPLE == 8
+  if (!transcode_only && cinfo->master->trellis_quant &&
+      cinfo->optimize_coding && !cinfo->arith_code &&
+      !cinfo->progressive_mode && cinfo->scan_info == NULL &&
+      !cinfo->master->lossless &&
+      (cinfo->num_components > 1 ||
+       (cinfo->comp_info[0].h_samp_factor == 1 &&
+        cinfo->comp_info[0].v_samp_factor == 1))) {
+    int ci, tbl;
+    boolean tables_ok = TRUE;
+
+    for (ci = 0; ci < cinfo->num_components; ci++) {
+      if (cinfo->comp_info[ci].dc_tbl_no < 0 ||
+          cinfo->comp_info[ci].dc_tbl_no >= NUM_HUFF_TBLS ||
+          cinfo->comp_info[ci].ac_tbl_no < 0 ||
+          cinfo->comp_info[ci].ac_tbl_no >= NUM_HUFF_TBLS)
+        tables_ok = FALSE;
+    }
+    if (tables_ok) {
+      cinfo->master->fold_gather = TRUE;
+      for (tbl = 0; tbl < NUM_HUFF_TBLS; tbl++) {
+        cinfo->master->fold_dc_counts[tbl] = NULL;
+        cinfo->master->fold_ac_counts[tbl] = NULL;
+      }
+      for (ci = 0; ci < cinfo->num_components; ci++) {
+        tbl = cinfo->comp_info[ci].dc_tbl_no;
+        if (cinfo->master->fold_dc_counts[tbl] == NULL) {
+          cinfo->master->fold_dc_counts[tbl] = (long *)
+            (*cinfo->mem->alloc_small) ((j_common_ptr)cinfo, JPOOL_IMAGE,
+                                        257 * sizeof(long));
+          memset(cinfo->master->fold_dc_counts[tbl], 0, 257 * sizeof(long));
+        }
+        tbl = cinfo->comp_info[ci].ac_tbl_no;
+        if (cinfo->master->fold_ac_counts[tbl] == NULL) {
+          cinfo->master->fold_ac_counts[tbl] = (long *)
+            (*cinfo->mem->alloc_small) ((j_common_ptr)cinfo, JPOOL_IMAGE,
+                                        257 * sizeof(long));
+          memset(cinfo->master->fold_ac_counts[tbl], 0, 257 * sizeof(long));
+        }
+        cinfo->master->fold_last_dc[ci] = 0;
+      }
+    }
+  }
+#endif
   
   if (cinfo->master->optimize_scans) {
     int i;

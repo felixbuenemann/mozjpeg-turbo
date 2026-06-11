@@ -143,6 +143,22 @@ struct jpeg_comp_master {
                               evaluation can verify that the controller is
                               not jctrans.c's (transcoding) [not exposed] */
 
+  /* Folded statistics gathering: when the encoder produces a single
+   * sequential scan with trellis quantization and Huffman optimization, the
+   * symbol statistics of the final scan are accumulated during each
+   * component's last trellis pass (while its coefficients are still in
+   * cache) and the separate statistics-gathering pass over the whole
+   * coefficient buffer is skipped.  [none of these fields are exposed]
+   */
+  boolean fold_gather;          /* feature enabled for this compression */
+  boolean trellis_pass_final;   /* current trellis pass is its component's
+                                   last, so the coefficients become final */
+  boolean fold_counts_ready;    /* statistics of all components accumulated */
+  boolean fold_replay;          /* current gather pass is being skipped */
+  long *fold_dc_counts[NUM_HUFF_TBLS]; /* accumulated symbol counts, indexed */
+  long *fold_ac_counts[NUM_HUFF_TBLS]; /*   by table number */
+  int fold_last_dc[MAX_COMPONENTS];    /* per-component DC predictors */
+
   float lambda_log_scale1;
   float lambda_log_scale2;
   
@@ -668,6 +684,14 @@ EXTERN(void)
 jpeg_mem_dest_internal (j_compress_ptr cinfo,
                unsigned char **outbuffer, unsigned long *outsize, int pool_id);
 #endif
+
+/* Folded statistics gathering for single-scan sequential output
+ * (jchuff.c, jcmaster.c, jccoefct.c)
+ */
+EXTERN(void) jpeg_fold_count_block(j_compress_ptr cinfo, JCOEFPTR block,
+                                   int last_dc_val, long dc_counts[],
+                                   long ac_counts[]);
+EXTERN(void) jpeg_fold_inject_counts(j_compress_ptr cinfo);
 
 /* Utility routines in jutils.c */
 EXTERN(long) jdiv_round_up(long a, long b);

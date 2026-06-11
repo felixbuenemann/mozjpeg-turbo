@@ -1039,6 +1039,58 @@ htest_one_block_simd(j_compress_ptr cinfo, JCOEFPTR block, int last_dc_val,
 
 
 /*
+ * Count the symbol statistics of one block into caller-provided count
+ * arrays.  This is used by the folded statistics gathering (jccoefct.c):
+ * when the encoder produces a single sequential scan, the statistics of
+ * that scan are accumulated during the trellis passes and the separate
+ * statistics-gathering pass is skipped.  The counts are identical to those
+ * that encode_mcu_gather() computes.
+ */
+
+GLOBAL(void)
+jpeg_fold_count_block(j_compress_ptr cinfo, JCOEFPTR block, int last_dc_val,
+                      long dc_counts[], long ac_counts[])
+{
+#ifdef WITH_SIMD
+  /* The folded gathering runs during a trellis pass, in which the entropy
+   * encoder is started in statistics-gathering mode, so simd_gather is
+   * valid here. */
+  if (((huff_entropy_ptr)cinfo->entropy)->simd_gather)
+    htest_one_block_simd(cinfo, block, last_dc_val, dc_counts, ac_counts);
+  else
+#endif
+    htest_one_block(cinfo, block, last_dc_val, dc_counts, ac_counts);
+}
+
+
+/*
+ * Install the statistics accumulated by the folded gathering as the current
+ * scan's symbol counts.  The entropy encoder must have been started in
+ * statistics-gathering mode (which allocates and zeroes the count arrays);
+ * finish_pass_gather() then generates the same Huffman tables that a real
+ * gather pass over the coefficient buffer would have produced.
+ */
+
+GLOBAL(void)
+jpeg_fold_inject_counts(j_compress_ptr cinfo)
+{
+  huff_entropy_ptr entropy = (huff_entropy_ptr)cinfo->entropy;
+  int ci;
+  jpeg_component_info *compptr;
+
+  for (ci = 0; ci < cinfo->comps_in_scan; ci++) {
+    compptr = cinfo->cur_comp_info[ci];
+    memcpy(entropy->dc_count_ptrs[compptr->dc_tbl_no],
+           cinfo->master->fold_dc_counts[compptr->dc_tbl_no],
+           257 * sizeof(long));
+    memcpy(entropy->ac_count_ptrs[compptr->ac_tbl_no],
+           cinfo->master->fold_ac_counts[compptr->ac_tbl_no],
+           257 * sizeof(long));
+  }
+}
+
+
+/*
  * Trial-encode one MCU's worth of Huffman-compressed coefficients.
  * No data is actually output, so no suspension return is possible.
  */
